@@ -8,6 +8,7 @@ from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 from typing import Dict, List, Union
 from sqlalchemy import create_engine, Engine
+from smolagents import ToolCallingAgent, OpenAIServerModel, load_dotenv, tool
 
 # Create an SQLite database
 db_engine = create_engine("sqlite:///munder_difflin.db")
@@ -591,21 +592,207 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 
 # Set up and load your env parameters and instantiate your model.
 
+load_dotenv()
+
+model = OpenAIServerModel(
+    model_id="gpt-4o-mini",  # Small, efficient model
+    api_key=os.getenv("UDACITY_OPENAI_API_KEY"),
+    api_base="https://openai.vocareum.com/v1",
+)
+
 
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
 
 
 # Tools for inventory agent
+@tool
+def tool_check_inventory(as_of_date: str) -> Dict[str, int]:
+    """
+    Tool for checking the current inventory levels of all items as of a given date.
 
+    Args:
+        as_of_date (str): The date (in ISO format) to check the inventory levels.
+    
+    Returns:
+        Dict[str, int]: A dictionary mapping item names to their current stock levels.
+    """
+    inventory_info = get_inventory_levels(as_of_date)
+    return {row["item_name"]: int(row["current_stock"]) for _, row in inventory_info.iterrows()}
+
+@tool
+def tool_check_stock_level(item_name: str, as_of_date: str) -> int:
+    """
+    Tool for checking the stock level of a specific item as of a given date.
+
+    Args:        item_name (str): The name of the item to check.
+        as_of_date (str): The date (in ISO format) to check the stock level.
+
+    Returns:
+        int: The current stock level of the specified item.
+    """
+    stock_info = get_stock_level(item_name, as_of_date)
+    return int(stock_info["current_stock"].iloc[0]) if not stock_info.empty else 0
+
+@tool
+def tool_check_delivery_timeline(input_date: str, quantity: int) -> str:
+    """
+    Tool for estimating the supplier delivery date based on the requested order quantity and a starting date.
+
+    Args:
+        input_date (str): The starting date in ISO format (YYYY-MM-DD).
+        quantity (int): The number of units in the order.
+
+    Returns:
+        str: Estimated delivery date in ISO format (YYYY-MM-DD).
+    """
+    return get_supplier_delivery_date(input_date, quantity)
 
 # Tools for quoting agent
+@tool
+def tool_read_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
+    """
+    Tool for retrieving historical quotes that match given search terms.
+
+    Args:
+        search_terms (List[str]): List of keywords to search in past quotes.
+        limit (int, optional): Maximum number of results to return. Default is 5.
+
+    Returns:
+        List[Dict]: A list of matching quotes, each represented as a dictionary.
+    """
+    return search_quote_history(search_terms, limit)
 
 
 # Tools for ordering agent
+@tool
+def tool_execute_order(
+    item_name: str,
+    transaction_type: str,
+    quantity: int,
+    price: float,
+    date: str,
+) -> int:
+    """
+    Tool for recording a transaction.
+
+    Args:
+        item_name (str): The item involved in the transaction.
+        transaction_type (str): Either 'stock_orders' or 'sales'.
+        quantity (int): The number of units involved.
+        price (float): The total transaction price.
+        date (str): The transaction date in ISO format.
+
+    Returns:
+        int: The ID of the created transaction.
+    """
+    return create_transaction(item_name, transaction_type, quantity, price, date)
+
+# Tools for the reporting agent
+@tool
+def tool_get_cash_balance(as_of_date: Union[str, datetime]) -> float:
+    """
+    Tool for checking the current cash balance as of a given date.
+
+    Args:
+        as_of_date (str or datetime): The date to check the cash balance for.
+
+    Returns:
+        float: The current cash balance at or before the specified date.
+    """
+    return get_cash_balance(as_of_date)
+
+@tool
+def tool_generate_financial_report(as_of_date: Union[str, datetime]) -> Dict:
+    """
+    Tool for generating the full financial report as of a given date.
+
+    Args:
+        as_of_date (str or datetime): The date to generate the report for.
+
+    Returns:
+        Dict: The financial report including cash balance, inventory value, and totals.
+    """
+    return generate_financial_report(as_of_date)
 
 
 # Set up your agents and create an orchestration agent that will manage them.
+
+class OrchestrationAgent(ToolCallingAgent):
+    """
+    The OrchestrationAgent coordinates the activities of multiple specialized agents
+    to handle complex requests. It manages the flow of information between agents,
+    ensuring that each agent has the necessary context and data to perform its tasks.
+
+    Attributes:
+        model (OpenAIServerModel): The language model used for reasoning and decision-making.
+        tools (List[Callable]): A list of tools available to the agent for performing actions.
+    """
+
+    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
+        super().__init__(model=model, tools=tools)
+        # Additional initialization if needed
+
+class InventoryManagerAgent(ToolCallingAgent):
+    """
+    The InventoryManagerAgent is responsible for managing inventory-related tasks.
+    It can check current stock levels, estimate delivery timelines, and provide
+    inventory information to other agents as needed.
+
+    Attributes:
+        model (OpenAIServerModel): The language model used for reasoning and decision-making.
+        tools (List[Callable]): A list of tools available to the agent for performing actions.
+    """
+
+    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
+        super().__init__(model=model, tools=tools)
+        # Additional initialization if needed
+
+class QuoteGeneratorAgent(ToolCallingAgent):
+    """
+    The QuoteGeneratorAgent handles tasks related to generating quotes for customer requests.
+    It can search historical quotes, analyze customer requirements, and produce new quotes
+    based on available inventory and pricing.
+
+    Attributes:
+        model (OpenAIServerModel): The language model used for reasoning and decision-making.
+        tools (List[Callable]): A list of tools available to the agent for performing actions.
+    """
+
+    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
+        super().__init__(model=model, tools=tools)
+        # Additional initialization if needed
+
+class SalesAgent(ToolCallingAgent):
+    """
+    The SalesAgent is responsible for handling sales transactions. It can process customer orders,
+    record sales in the database, and update inventory levels accordingly.
+
+    Attributes:
+        model (OpenAIServerModel): The language model used for reasoning and decision-making.
+        tools (List[Callable]): A list of tools available to the agent for performing actions.
+    """
+
+    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
+        super().__init__(model=model, tools=tools)
+        # Additional initialization if needed
+
+class ReportingAgent(ToolCallingAgent):
+    """
+    The ReportingAgent generates financial reports and provides insights into the company's
+    financial status. It can retrieve cash balances, inventory valuations, and produce
+    comprehensive reports for management review.
+
+    Attributes:
+        model (OpenAIServerModel): The language model used for reasoning and decision-making.
+        tools (List[Callable]): A list of tools available to the agent for performing actions.
+    """
+
+    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
+        super().__init__(model=model, tools=tools)
+        # Additional initialization if needed
+
+
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
