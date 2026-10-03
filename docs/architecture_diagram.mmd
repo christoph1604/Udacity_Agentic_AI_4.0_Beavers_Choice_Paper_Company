@@ -1,0 +1,83 @@
+---
+config:
+  layout: dagre
+---
+flowchart TB
+    User["👤 User/Customer"] -- request --> OrchestratorAgent["🤖 Orchestrator Agent"]
+    OrchestratorAgent -- response --> User
+    OrchestratorAgent -- delegate --> InventoryAgent["📦 Inventory Manager Agent"] & QuoteAgent["💰 Quote Generator Agent"] & SalesAgent["🛒 Sales Agent"] & ReportingAgent["📊 Reporting Agent"]
+    InventoryAgent -- answer --> OrchestratorAgent
+    QuoteAgent -- answer --> OrchestratorAgent
+    SalesAgent -- answer --> OrchestratorAgent
+    ReportingAgent -- answer --> OrchestratorAgent
+
+    OrchestratorNotes["Responsibilities:<br>• Single contact point for customer requests<br>• Analyze incoming requests<br>• Dispatch tasks to specialized agents<br>• Synthesize agent answers<br>• Create the final customer answer"] -.-> OrchestratorAgent
+    InventoryNotes["Responsibilities:<br>• Track company inventory<br>• Answer inventory-related questions<br>• Check whether goods requests can be fulfilled<br>• Assess reorder needs"] -.-> InventoryAgent
+    QuoteNotes["Responsibilities:<br>• Generate customer quotes, including pricing<br>• Apply bulk discounts"] -.-> QuoteAgent
+    SalesNotes["Responsibilities:<br>• Finalize and register sales transactions<br>• Consider inventory levels and delivery timelines<br>• Report successful transaction execution"] -.-> SalesAgent
+    ReportingNotes@{ shape: comment, label: "Responsibilities:<br/>• Monitor the company's financial situation<br/>• Report financial KPIs" } -.-> ReportingAgent
+
+    InventoryAgent --> ToolCheckInventory["tool_check_inventory"] & ToolCheckStockLevel["tool_check_stock_level"] & ToolCheckDeliveryTimeline["tool_check_delivery_timeline"]
+    QuoteAgent --> ToolReadQuoteHistory["tool_read_quote_history"]
+    SalesAgent --> ToolExecuteOrder["tool_execute_order"] & ToolCheckStockLevel
+    ReportingAgent --> ToolGetCashBalance["tool_get_cash_balance"] & ToolGenerateReport["tool_generate_financial_report"]
+
+    ToolCheckInventory --> FuncGetAllInventory["get_all_inventory"]
+    ToolCheckStockLevel --> FuncGetStockLevel["get_stock_level"]
+    ToolCheckDeliveryTimeline --> FuncGetSupplierDeliveryDate["get_supplier_delivery_date"]
+    ToolReadQuoteHistory --> FuncSearchQuoteHistory["search_quote_history"]
+    ToolExecuteOrder --> FuncCreateTransaction["create_transaction"]
+    ToolGetCashBalance --> FuncGetCashBalance["get_cash_balance"]
+    ToolGenerateReport --> FuncGenerateFinancialReport["generate_financial_report"]
+
+    FuncGetAllInventory --> Database[("🗄️ Database")]
+    FuncGetStockLevel --> Database
+    FuncSearchQuoteHistory --> Database
+    FuncGetSupplierDeliveryDate --> Database
+    FuncCreateTransaction --> Database
+    FuncGetCashBalance --> Database
+    FuncGenerateFinancialReport --> Database
+
+    OrchestratorNotes@{ shape: comment }
+    InventoryNotes@{ shape: comment }
+    QuoteNotes@{ shape: comment }
+    SalesNotes@{ shape: comment }
+
+    subgraph Legend["Legend"]
+        direction LR
+        LegendAgent["Blue = Agents"]
+        LegendTool["Green = Tools"]
+        LegendFunction["Yellow = System functions"]
+    end
+
+    User:::userStyle
+    OrchestratorAgent:::orchestratorStyle
+    InventoryAgent:::agentStyle
+    QuoteAgent:::agentStyle
+    SalesAgent:::agentStyle
+    ReportingAgent:::agentStyle
+    ToolCheckInventory:::toolStyle
+    ToolCheckStockLevel:::toolStyle
+    ToolCheckDeliveryTimeline:::toolStyle
+    ToolReadQuoteHistory:::toolStyle
+    ToolExecuteOrder:::toolStyle
+    ToolGetCashBalance:::toolStyle
+    ToolGenerateReport:::toolStyle
+    FuncGetAllInventory:::funcStyle
+    FuncGetStockLevel:::funcStyle
+    FuncGetSupplierDeliveryDate:::funcStyle
+    FuncSearchQuoteHistory:::funcStyle
+    FuncCreateTransaction:::funcStyle
+    FuncGetCashBalance:::funcStyle
+    FuncGenerateFinancialReport:::funcStyle
+    Database:::dbStyle
+    LegendAgent:::agentStyle
+    LegendTool:::toolStyle
+    LegendFunction:::funcStyle
+
+    classDef userStyle stroke:#fb7185,fill:#fff1f2
+    classDef orchestratorStyle stroke:#818cf8,fill:#eef2ff
+    classDef agentStyle stroke:#38bdf8,fill:#f0f9ff
+    classDef toolStyle stroke:#4ade80,fill:#f0fdf4
+    classDef funcStyle stroke:#facc15,fill:#fefce8
+    classDef dbStyle stroke:#f87171,fill:#fef2f2
