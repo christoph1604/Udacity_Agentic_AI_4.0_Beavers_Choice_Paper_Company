@@ -535,14 +535,25 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
         limit (int, optional): Maximum number of quote records to return. Default is 5.
 
     Returns:
-        List[Dict]: A list of matching quotes, each represented as a dictionary with fields:
-            - original_request
-            - total_amount
-            - quote_explanation
-            - job_type
-            - order_size
-            - event_type
-            - order_date
+        List[Dict]: Matching quotes, each represented as a dictionary with these fields:
+            - original_request (str): The customer's request text from `quote_requests.response`.
+            - total_amount (int or float): The quoted total amount in dollars.
+            - quote_explanation (str): The explanation of the quote, including pricing details.
+            - job_type (str): Customer's role. Values observed in `quotes.csv` include
+                business owner, city hall clerk, event manager, hotel manager,
+                law firm receptionist, non-profit director, office manager,
+                restaurant manager, retail store manager, school board resouorce manager,
+                school principal, and school teacher.
+            - order_size (str): Order-size category; observed values are small, medium,
+                and large.
+            - event_type (str): Event category. Values observed in `quotes.csv` include
+                assembly, celebration, ceremony, concert, conference, demonstration,
+                exhibition, festival, gathering, meeting, parade, party, performance,
+                reception, and show.
+            - order_date (str): Quote date as an ISO 8601 datetime string. The current
+                database initialization assigns 2025-01-01T00:00:00 to historical quotes.
+            The category values describe the supplied CSV data and are not enforced
+            enumerations.
     """
     conditions = []
     params = {}
@@ -617,7 +628,7 @@ def tool_check_inventory(as_of_date: str) -> Dict[str, int]:
     Returns:
         Dict[str, int]: A dictionary mapping item names to their current stock levels.
     """
-    inventory_info = get_inventory_levels(as_of_date)
+    inventory_info = get_all_inventory(as_of_date)
     return {row["item_name"]: int(row["current_stock"]) for _, row in inventory_info.iterrows()}
 
 @tool
@@ -625,7 +636,8 @@ def tool_check_stock_level(item_name: str, as_of_date: str) -> int:
     """
     Tool for checking the stock level of a specific item as of a given date.
 
-    Args:        item_name (str): The name of the item to check.
+    Args:        
+        item_name (str): The name of the item to check.
         as_of_date (str): The date (in ISO format) to check the stock level.
 
     Returns:
@@ -659,7 +671,18 @@ def tool_read_quote_history(search_terms: List[str], limit: int = 5) -> List[Dic
         limit (int, optional): Maximum number of results to return. Default is 5.
 
     Returns:
-        List[Dict]: A list of matching quotes, each represented as a dictionary.
+        List[Dict]: Matching quotes, each represented as a dictionary with these fields:
+            - original_request (str): The customer's request text from `quote_requests.response`.
+            - total_amount (int or float): The quoted total amount in dollars.
+            - quote_explanation (str): The explanation of the quote, including pricing details.
+            - job_type (str): Customer's role. Examples are: 
+                business owner, city hall clerk, event manager, ...
+            - order_size (str): Order-size category; observed values are small, medium,
+                and large.
+            - event_type (str): Event category. Examples are: 
+                assembly, celebration, ceremony, concert, conference,...
+            - order_date (str): Quote date as an ISO 8601 datetime string. The current
+                database initialization assigns 2025-01-01T00:00:00 to historical quotes.
     """
     return search_quote_history(search_terms, limit)
 
@@ -674,7 +697,7 @@ def tool_execute_order(
     date: str,
 ) -> int:
     """
-    Tool for recording a transaction.
+    Tool for recording a transaction in the company's database and booking system.
 
     Args:
         item_name (str): The item involved in the transaction.
@@ -692,7 +715,7 @@ def tool_execute_order(
 @tool
 def tool_get_cash_balance(as_of_date: Union[str, datetime]) -> float:
     """
-    Tool for checking the current cash balance as of a given date.
+    Tool for checking the current cash balance of the company as of a given date.
 
     Args:
         as_of_date (str or datetime): The date to check the cash balance for.
@@ -705,13 +728,35 @@ def tool_get_cash_balance(as_of_date: Union[str, datetime]) -> float:
 @tool
 def tool_generate_financial_report(as_of_date: Union[str, datetime]) -> Dict:
     """
-    Tool for generating the full financial report as of a given date.
+    Tool for generating the full financial report of the company as of a given date.
 
     Args:
         as_of_date (str or datetime): The date to generate the report for.
 
     Returns:
-        Dict: The financial report including cash balance, inventory value, and totals.
+        Dict: A financial report with the following structure:
+            - as_of_date (str): The report cutoff date. Datetime inputs are converted
+                to ISO 8601 strings; string inputs are returned unchanged.
+            - cash_balance (float): Cash balance at or before the cutoff date,
+                calculated as sales revenue minus stock purchase costs.
+            - inventory_value (float): Total value of inventory at the cutoff date,
+                calculated from each item's stock multiplied by its unit price.
+            - total_assets (float): The sum of cash_balance and inventory_value.
+            - inventory_summary (List[Dict[str, str or int or float]]): One record
+                per item in the inventory table. Each record contains:
+                    - item_name (str): Inventory item name.
+                    - stock (int or float): Units in stock at the cutoff date.
+                    - unit_price (float): Price per unit from the inventory table.
+                    - value (float): The item's stock multiplied by its unit price.
+            - top_selling_products (List[Dict[str, str or int or float or None]]):
+                Up to five sales records grouped by item and ordered by total_revenue.
+                Each record contains:
+                    - item_name (str or None): Item name; None is possible for the
+                        opening cash-balance transaction, which has no item name.
+                    - total_units (int, float, or None): Total units sold. This can be
+                        None when the grouped transaction has no units recorded.
+                    - total_revenue (int or float): Sum of transaction prices for the
+                        item through the cutoff date.
     """
     return generate_financial_report(as_of_date)
 
@@ -720,33 +765,164 @@ def tool_generate_financial_report(as_of_date: Union[str, datetime]) -> Dict:
 
 class OrchestrationAgent(ToolCallingAgent):
     """
-    The OrchestrationAgent coordinates the activities of multiple specialized agents
-    to handle complex requests. It manages the flow of information between agents,
-    ensuring that each agent has the necessary context and data to perform its tasks.
+    Coordinates customer inquiries by selecting and calling the specialist best suited
+    to each task. The inventory manager checks on-hand stock, estimates delivery dates,
+    and places explicitly requested stock orders; the quote generator uses historical
+    quotes as context; the sales agent records authorized customer purchases; and the
+    reporting agent prepares dated financial reports.
+
+    For customer requests that require specific items or quantities, the orchestrator
+    checks inventory before quoting or completing a sale. If on-hand stock is
+    insufficient, it explicitly asks the inventory manager to place a stock order for
+    the shortage, then communicates any missing order details or estimated delivery
+    timing without presenting incoming stock as already available.
 
     Attributes:
         model (OpenAIServerModel): The language model used for reasoning and decision-making.
-        tools (List[Callable]): A list of tools available to the agent for performing actions.
+        inventory_manager_agent (InventoryManagerAgent): Handles inventory-related tasks.
+        quote_generator_agent (QuoteGeneratorAgent): Handles customer quote requests.
+        sales_agent (SalesAgent): Handles customer orders and sales transactions.
+        reporting_agent (ReportingAgent): Handles financial reporting requests.
     """
 
-    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
-        super().__init__(model=model, tools=tools)
-        # Additional initialization if needed
+    PROMPT = (
+        "You coordinate customer inquiries for a paper supply company. Classify each "
+        "request, call the relevant specialist tool, and use the specialist's response "
+        "when replying. Delegate only the work that is relevant to the request.\n\n"
+        "Choose a specialist as follows:\n"
+        "- Call the inventory manager for on-hand stock, item availability, supplier "
+        "delivery estimates, and stock reorders.\n"
+        "- Call the quote generator when a customer asks for a quote or pricing "
+        "guidance. Include relevant request details and any inventory findings.\n"
+        "- Call the sales agent only when a customer clearly authorizes a purchase and "
+        "the item, quantity, total price, and transaction date are known.\n"
+        "- Call the reporting agent for cash balances, inventory valuations, total "
+        "assets, or top-selling product reports.\n\n"
+        "For a customer quote or purchase request that names an item and quantity, "
+        "check on-hand stock with the inventory manager before quoting availability or "
+        "asking the sales agent to record a sale. If the available stock is less than "
+        "the requested quantity, call the inventory manager again and explicitly tell "
+        "it to place a stock order for the shortfall using tool_execute_order with "
+        'transaction_type="stock_orders". Pass along the item, shortfall quantity, '
+        "request or transaction date, and any supplier purchase price provided in the "
+        "request or context. Do not invent a missing price or date; have the inventory "
+        "manager request missing details, and do not say the order was placed unless "
+        "it confirms successful execution.\n\n"
+        "Treat newly ordered stock as incoming, not as currently on-hand. Use the "
+        "inventory manager's delivery estimate when explaining when it may become "
+        "available. Include the stock and delivery findings in any follow-up call to "
+        "the quote generator or sales agent.\n\n"
+        "Historical quotes are examples, not guarantees of current prices, discounts, "
+        "or availability. Do not invent prices, discounts, stock, or delivery promises. "
+        "Do not record a customer sale without clear authorization. Report actions as "
+        "completed only after the responsible agent confirms them; otherwise explain "
+        "what is pending or what information is needed."
+    )
+
+    def __init__(self, model: OpenAIServerModel):
+        self.model = model
+        self.inventory_manager_agent = InventoryManagerAgent(model)
+        self.quote_generator_agent = QuoteGeneratorAgent(model)
+        self.sales_agent = SalesAgent(model)
+        self.reporting_agent = ReportingAgent(model)
+
+        @tool
+        def call_inventory_manager(request: str) -> str:
+            """Delegate inventory and supplier delivery questions to the inventory manager.
+
+            Args:
+                request: The inventory-related request.
+
+            Returns:
+                The inventory manager's response.
+            """
+            prompt = "TODO: Define the inventory manager delegation prompt."
+            return self.inventory_manager_agent.run(f"{prompt}\n\n{request}")
+
+        @tool
+        def call_quote_generator(request: str) -> str:
+            """Delegate customer quote requests to the quote generator.
+
+            Args:
+                request: The customer's quote request.
+
+            Returns:
+                The quote generator's response.
+            """
+            prompt = "TODO: Define the quote generator delegation prompt."
+            return self.quote_generator_agent.run(f"{prompt}\n\n{request}")
+
+        @tool
+        def call_sales_agent(request: str) -> str:
+            """Delegate customer orders to the sales agent.
+
+            Args:
+                request: The order or sales task to process.
+
+            Returns:
+                The sales agent's response.
+            """
+            prompt = "TODO: Define the sales agent delegation prompt."
+            return self.sales_agent.run(f"{prompt}\n\n{request}")
+
+        @tool
+        def call_reporting_agent(request: str) -> str:
+            """Delegate financial reporting requests to the reporting agent.
+
+            Args:
+                request: The financial report request.
+
+            Returns:
+                The reporting agent's response.
+            """
+            prompt = "TODO: Define the reporting agent delegation prompt."
+            return self.reporting_agent.run(f"{prompt}\n\n{request}")
+
+        super().__init__(
+            model=model,
+            tools=[
+                call_inventory_manager,
+                call_quote_generator,
+                call_sales_agent,
+                call_reporting_agent,
+            ],
+            instructions=self.PROMPT,
+        )
 
 class InventoryManagerAgent(ToolCallingAgent):
     """
-    The InventoryManagerAgent is responsible for managing inventory-related tasks.
-    It can check current stock levels, estimate delivery timelines, and provide
-    inventory information to other agents as needed.
+    Checks item stock levels, estimates supplier delivery dates, and places explicitly
+    requested stock reorders when the required order details are available.
 
     Attributes:
         model (OpenAIServerModel): The language model used for reasoning and decision-making.
         tools (List[Callable]): A list of tools available to the agent for performing actions.
     """
 
-    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
-        super().__init__(model=model, tools=tools)
-        # Additional initialization if needed
+    PROMPT = (
+        "Answer inventory questions using the inventory tools and the requested as-of "
+        "date. Report stock quantities accurately, and use the delivery timeline tool "
+        "when estimating arrival dates. Place a stock reorder when explicitly asked to "
+        "do so. Before ordering, make sure the item name, quantity, total purchase "
+        "price, and transaction date are known; ask for any missing details instead of "
+        "guessing. Record the order with tool_execute_order using "
+        'transaction_type="stock_orders". Report that the reorder was placed only '
+        "after the tool confirms it. Do not use this process to record customer sales."
+    )
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            model=model,
+            tools=[
+                tool_check_inventory,
+                tool_check_stock_level,
+                tool_check_delivery_timeline,
+                tool_execute_order,
+            ],
+            instructions=self.PROMPT,
+            name="inventory_manager_agent_01",
+            description="Checks inventory, estimates delivery timelines, and places authorized stock reorders.",
+        )
 
 class QuoteGeneratorAgent(ToolCallingAgent):
     """
@@ -759,38 +935,76 @@ class QuoteGeneratorAgent(ToolCallingAgent):
         tools (List[Callable]): A list of tools available to the agent for performing actions.
     """
 
-    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
-        super().__init__(model=model, tools=tools)
-        # Additional initialization if needed
+    PROMPT = (
+        "Use the quote history tool to find relevant examples, then explain how they "
+        "relate to the customer's request. Treat historical quotes as context, not as "
+        "current prices. Apply only discount rules and prices provided in the request "
+        "or other supplied context; do not invent prices or discounts. Ask for missing "
+        "details needed to prepare a reliable quote, and make clear when a quote is "
+        "only an estimate."
+    )
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            model=model,
+            tools=[tool_read_quote_history],
+            instructions=self.PROMPT,
+            name="quote_generator_agent_01",
+            description="Generates customer quotes using request details and relevant historical quotes.",
+        )
 
 class SalesAgent(ToolCallingAgent):
     """
-    The SalesAgent is responsible for handling sales transactions. It can process customer orders,
-    record sales in the database, and update inventory levels accordingly.
+    Checks stock and records authorized customer sales transactions.
 
     Attributes:
         model (OpenAIServerModel): The language model used for reasoning and decision-making.
         tools (List[Callable]): A list of tools available to the agent for performing actions.
     """
 
-    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
-        super().__init__(model=model, tools=tools)
-        # Additional initialization if needed
+    PROMPT = (
+        "Before recording a sale, use the stock tool to verify the requested quantity "
+        "is available. Record a sale only when the customer has clearly authorized it "
+        "and the item, quantity, total price, and transaction date are known. Use "
+        'transaction_type="sales" for customer purchases. Do not invent prices or '
+        "promise a delivery date that has not been confirmed."
+    )
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            model=model,
+            tools=[tool_execute_order, tool_check_stock_level],
+            instructions=self.PROMPT,
+            name="sales_agent_01",
+            description="Processes customer orders, records sales, and checks stock availability.",
+        )
 
 class ReportingAgent(ToolCallingAgent):
     """
-    The ReportingAgent generates financial reports and provides insights into the company's
-    financial status. It can retrieve cash balances, inventory valuations, and produce
-    comprehensive reports for management review.
+    Generates dated financial reports covering cash, inventory value, total assets,
+    and top-selling products.
 
     Attributes:
         model (OpenAIServerModel): The language model used for reasoning and decision-making.
         tools (List[Callable]): A list of tools available to the agent for performing actions.
     """
 
-    def __init__(self, model: OpenAIServerModel, tools: List[callable]):
-        super().__init__(model=model, tools=tools)
-        # Additional initialization if needed
+    PROMPT = (
+        "Generate reports using the financial report tool and the requested as-of date. "
+        "Summarize cash balance, inventory value, and total assets; include itemized "
+        "inventory or top-selling products when relevant. Clearly label the report date "
+        "and distinguish reported figures from any interpretation. Do not infer values "
+        "the report does not provide."
+    )
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            model=model,
+            tools=[tool_generate_financial_report],
+            instructions=self.PROMPT,
+            name="reporting_agent_01",
+            description="Generates financial reports on cash, inventory, and company assets.",
+        )
 
 
 
