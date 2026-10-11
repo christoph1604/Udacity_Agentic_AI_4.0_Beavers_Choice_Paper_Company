@@ -636,7 +636,7 @@ def tool_check_stock_level(item_name: str, as_of_date: str) -> int:
     """
     Tool for checking the stock level of a specific item as of a given date.
 
-    Args:        
+    Args:
         item_name (str): The name of the item to check.
         as_of_date (str): The date (in ISO format) to check the stock level.
 
@@ -772,7 +772,7 @@ class OrchestrationAgent(ToolCallingAgent):
     reporting agent prepares dated financial reports.
 
     For customer requests that require specific items or quantities, the orchestrator
-    checks inventory before quoting or completing a sale. If on-hand stock is
+    lets check inventory before quoting or completing a sale. If on-hand stock is
     insufficient, it explicitly asks the inventory manager to place a stock order for
     the shortage, then communicates any missing order details or estimated delivery
     timing without presenting incoming stock as already available.
@@ -787,8 +787,10 @@ class OrchestrationAgent(ToolCallingAgent):
 
     PROMPT = (
         "You coordinate customer inquiries for a paper supply company. Classify each "
-        "request, call the relevant specialist tool, and use the specialist's response "
-        "when replying. Delegate only the work that is relevant to the request.\n\n"
+        "request, forward requests to the relevant specialists, accept their responses, "
+        "process thema and use them for further actions. "
+        "Use the input from the specialists' responses for your reply to the customer."
+        "Delegate only the work that is relevant to the request.\n\n"
         "Choose a specialist as follows:\n"
         "- Call the inventory manager for on-hand stock, item availability, supplier "
         "delivery estimates, and stock reorders.\n"
@@ -798,10 +800,11 @@ class OrchestrationAgent(ToolCallingAgent):
         "the item, quantity, total price, and transaction date are known.\n"
         "- Call the reporting agent for cash balances, inventory valuations, total "
         "assets, or top-selling product reports.\n\n"
+        "When forwarding a task to a specialist, always formulate a clear request that includes all relevant details and context. "
         "For a customer quote or purchase request that names an item and quantity, "
         "check on-hand stock with the inventory manager before quoting availability or "
-        "asking the sales agent to record a sale. If the available stock is less than "
-        "the requested quantity, call the inventory manager again and explicitly tell "
+        "asking the sales agent to record a sale. Reject a purchase request if the item is not in stock and the expected delivery date is higher than the customer-specified date. If the item is in stock, confirm the available quantity and any delivery estimate before quoting a price or recording a sale.\n\n"
+        "If delivery in time is realistic, call the inventory manager again and explicitly tell "
         "it to place a stock order for the shortfall using tool_execute_order with "
         'transaction_type="stock_orders". Pass along the item, shortfall quantity, '
         "request or transaction date, and any supplier purchase price provided in the "
@@ -810,7 +813,8 @@ class OrchestrationAgent(ToolCallingAgent):
         "it confirms successful execution.\n\n"
         "Treat newly ordered stock as incoming, not as currently on-hand. Use the "
         "inventory manager's delivery estimate when explaining when it may become "
-        "available. Include the stock and delivery findings in any follow-up call to "
+        "available."
+        "Include the stock and delivery findings (also dates) in any follow-up call to "
         "the quote generator or sales agent.\n\n"
         "Historical quotes are examples, not guarantees of current prices, discounts, "
         "or availability. Do not invent prices, discounts, stock, or delivery promises. "
@@ -836,8 +840,7 @@ class OrchestrationAgent(ToolCallingAgent):
             Returns:
                 The inventory manager's response.
             """
-            prompt = "TODO: Define the inventory manager delegation prompt."
-            return self.inventory_manager_agent.run(f"{prompt}\n\n{request}")
+            return self.inventory_manager_agent.run(request)
 
         @tool
         def call_quote_generator(request: str) -> str:
@@ -849,8 +852,7 @@ class OrchestrationAgent(ToolCallingAgent):
             Returns:
                 The quote generator's response.
             """
-            prompt = "TODO: Define the quote generator delegation prompt."
-            return self.quote_generator_agent.run(f"{prompt}\n\n{request}")
+            return self.quote_generator_agent.run(request)
 
         @tool
         def call_sales_agent(request: str) -> str:
@@ -862,8 +864,7 @@ class OrchestrationAgent(ToolCallingAgent):
             Returns:
                 The sales agent's response.
             """
-            prompt = "TODO: Define the sales agent delegation prompt."
-            return self.sales_agent.run(f"{prompt}\n\n{request}")
+            return self.sales_agent.run(request)
 
         @tool
         def call_reporting_agent(request: str) -> str:
@@ -875,8 +876,7 @@ class OrchestrationAgent(ToolCallingAgent):
             Returns:
                 The reporting agent's response.
             """
-            prompt = "TODO: Define the reporting agent delegation prompt."
-            return self.reporting_agent.run(f"{prompt}\n\n{request}")
+            return self.reporting_agent.run(request)
 
         super().__init__(
             model=model,
@@ -1007,14 +1007,12 @@ class ReportingAgent(ToolCallingAgent):
         )
 
 
-
-
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -1040,6 +1038,8 @@ def run_test_scenarios():
     ############
     ############
 
+    multi_agent_system_orchestrator = OrchestrationAgent(model)
+
     results = []
     for idx, row in quote_requests_sample.iterrows():
         request_date = row["request_date"].strftime("%Y-%m-%d")
@@ -1061,7 +1061,7 @@ def run_test_scenarios():
         ############
         ############
 
-        # response = call_your_multi_agent_system(request_with_date)
+        response = multi_agent_system_orchestrator.run(request_with_date)
 
         # Update state
         report = generate_financial_report(request_date)
