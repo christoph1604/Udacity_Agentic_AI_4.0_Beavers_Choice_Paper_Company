@@ -4,9 +4,11 @@ import os
 import time
 import dotenv
 import ast
+import json
 from sqlalchemy.sql import text
-from datetime import datetime, timedelta
-from typing import Dict, List, Union
+from datetime import date as DateType, datetime, timedelta
+from typing import Any, Callable, Dict, List, Literal, Optional, Type, TypeVar, Union
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
 from sqlalchemy import create_engine, Engine
 from smolagents import ToolCallingAgent, OpenAIServerModel, load_dotenv, tool
 
@@ -629,7 +631,7 @@ def tool_check_inventory(as_of_date: str) -> Dict[str, int]:
         Dict[str, int]: A dictionary mapping item names to their current stock levels.
     """
     inventory_info = get_all_inventory(as_of_date)
-    return {row["item_name"]: int(row["current_stock"]) for _, row in inventory_info.iterrows()}
+    return {item: int(stock) for item, stock in inventory_info.items()}
 
 @tool
 def tool_check_stock_level(item_name: str, as_of_date: str) -> int:
@@ -659,6 +661,40 @@ def tool_check_delivery_timeline(input_date: str, quantity: int) -> str:
         str: Estimated delivery date in ISO format (YYYY-MM-DD).
     """
     return get_supplier_delivery_date(input_date, quantity)
+
+@tool
+def tool_get_unit_price(item_name: str) -> float:
+    """
+    Tool for looking up the unit price of an item in the inventory table.
+
+    Args:
+        item_name (str): The exact name of the item.
+
+    Returns:
+        float: The price per unit.
+    """
+    result = pd.read_sql(
+        "SELECT unit_price FROM inventory WHERE item_name = :item_name",
+        db_engine,
+        params={"item_name": item_name},
+    )
+    if result.empty:
+        raise ValueError(f"Unknown item: {item_name}")
+    return float(result["unit_price"].iloc[0])
+
+@tool
+def tool_calculate_shortfall(requested_quantity: int, stock_on_hand: int) -> int:
+    """
+    Tool for calculating how many units are missing to cover a requested quantity.
+
+    Args:
+        requested_quantity (int): The number of units requested.
+        stock_on_hand (int): The number of units on hand.
+
+    Returns:
+        int: The missing units, or 0 if the stock covers the request.
+    """
+    return max(requested_quantity - stock_on_hand, 0)
 
 # Tools for quoting agent
 @tool
@@ -763,6 +799,274 @@ def tool_generate_financial_report(as_of_date: Union[str, datetime]) -> Dict:
 
 # Set up your agents and create an orchestration agent that will manage them.
 
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+def parse_model(model_cls: Type[ModelT], answer: Any) -> ModelT:
+    """Parse an agent's final answer (dict or JSON string) into model_cls."""
+    data = answer if isinstance(answer, dict) else json.loads(answer)
+    return model_cls.model_validate(data)
+
+def make_final_answer_check(model_cls: Type[BaseModel]) -> Callable[..., bool]:
+    """Build a smolagents final-answer check; a failure is fed back to the agent so it retries."""
+    def check_final_answer(final_answer: Any, memory: Any, agent: Any = None) -> bool:
+        parse_model(model_cls, final_answer)
+        return True
+    return check_final_answer
+
+def delegate(
+    agent: ToolCallingAgent,
+    request: Any,
+    request_cls: Type[BaseModel],
+    response_cls: Type[BaseModel],
+) -> str:
+    """Validate the request, run the agent, and return its validated response as JSON."""
+    try:
+        validated = request_cls.model_validate(request)
+    except ValidationError as e:
+        schema = json.dumps(request_cls.model_json_schema())
+        return response_cls(
+            status="rejected",
+            result=(
+                f"Request must conform to this JSON schema: {schema}. "
+                f"Errors: {e.errors(include_url=False, include_input=False)}"
+            ),
+        ).model_dump_json()
+    try:
+        answer = agent.run(validated.model_dump_json())
+        return parse_model(response_cls, answer).model_dump_json()
+    except Exception as e:
+        return response_cls(
+            status="failed",
+            result=f"{agent.name} did not return a valid response: {e}",
+        ).model_dump_json()
+
+class InventoryRequest(BaseModel):
+    """Structured request sent from the orchestrator to the inventory manager."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: str = Field(
+        min_length=1,
+        description="What the inventory manager should do.",
+    )
+    item: str = Field(min_length=1, description="Exact item name.")
+    quantity: StrictInt = Field(gt=0, description="Number of units, as an integer.")
+    date: DateType = Field(description="Transaction or as-of date in YYYY-MM-DD format.")
+
+INVENTORY_REQUEST_SCHEMA = json.dumps(InventoryRequest.model_json_schema())
+
+class InventoryResponse(BaseModel):
+    """Structured response sent from the inventory manager back to the orchestrator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "needs_info", "rejected", "failed"] = Field(
+        description="Outcome of the request."
+    )
+    result: str = Field(description="Description of the work done.")
+    item: str = Field(default="", description="Item name from the request.")
+    stock_on_hand: Optional[StrictInt] = Field(
+        default=None, description="Units on hand as of the request date, if checked."
+    )
+    shortfall: Optional[StrictInt] = Field(
+        default=None, description="Requested units not covered by stock on hand, if calculated."
+    )
+    estimated_delivery_date: Optional[DateType] = Field(
+        default=None, description="Estimated supplier delivery date (YYYY-MM-DD) for the shortfall, if estimated."
+    )
+    order_placed: bool = Field(
+        default=False, description="True only if a stock order was recorded successfully."
+    )
+    transaction_id: Optional[StrictInt] = Field(
+        default=None, description="ID of the recorded stock order transaction, if placed."
+    )
+    total_price: Optional[float] = Field(
+        default=None, description="Total purchase price of the stock order, if placed."
+    )
+
+INVENTORY_RESPONSE_SCHEMA = json.dumps(InventoryResponse.model_json_schema())
+
+class QuoteItem(BaseModel):
+    """One requested item of a quote request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item: str = Field(min_length=1, description="Exact item name.")
+    quantity: StrictInt = Field(gt=0, description="Number of units, as an integer.")
+    stock_on_hand: Optional[StrictInt] = Field(
+        default=None, description="Units on hand, from the inventory manager's response."
+    )
+    estimated_delivery_date: Optional[DateType] = Field(
+        default=None, description="Estimated supplier delivery date (YYYY-MM-DD), from the inventory manager."
+    )
+
+class QuoteRequest(BaseModel):
+    """Structured request sent from the orchestrator to the quote generator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: str = Field(min_length=1, description="What the quote generator should do.")
+    items: List[QuoteItem] = Field(min_length=1, description="Requested items with quantities.")
+    date: DateType = Field(description="Request date in YYYY-MM-DD format.")
+    job_type: Optional[str] = Field(default=None, description="Customer's role, e.g. event manager.")
+    order_size: Optional[str] = Field(default=None, description="Order size: small, medium or large.")
+    event_type: Optional[str] = Field(default=None, description="Event category, e.g. ceremony.")
+
+QUOTE_REQUEST_SCHEMA = json.dumps(QuoteRequest.model_json_schema())
+
+class QuoteLineItem(BaseModel):
+    """Price of one item in a quote."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item: str
+    quantity: StrictInt
+    unit_price: Optional[float] = None
+    line_total: Optional[float] = None
+
+class QuoteResponse(BaseModel):
+    """Structured response sent from the quote generator back to the orchestrator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "needs_info", "rejected", "failed"] = Field(
+        description="Outcome of the request."
+    )
+    result: str = Field(
+        description="How the quote history was used, and what is assumed or missing."
+    )
+    is_estimate: bool = Field(default=True, description="True if the quote is only an estimate.")
+    total_amount: Optional[float] = Field(
+        default=None, description="Total quoted amount in dollars; required when status is ok."
+    )
+    line_items: List[QuoteLineItem] = Field(
+        default_factory=list, description="Per-item prices, only if they can be derived from the context."
+    )
+
+    @model_validator(mode="after")
+    def check_totals(self):
+        if self.status == "ok" and self.total_amount is None:
+            raise ValueError("total_amount is required when status is ok")
+        totals = [li.line_total for li in self.line_items]
+        if self.total_amount is not None and totals and None not in totals:
+            if abs(sum(totals) - self.total_amount) > 0.01:
+                raise ValueError("line_total values must sum to total_amount")
+        return self
+
+QUOTE_RESPONSE_SCHEMA = json.dumps(QuoteResponse.model_json_schema())
+
+class SaleItem(BaseModel):
+    """One item of an authorized customer purchase."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item: str = Field(min_length=1, description="Exact item name.")
+    quantity: StrictInt = Field(gt=0, description="Number of units, as an integer.")
+    total_price: float = Field(gt=0, description="Total sale price for this item, from the quote.")
+
+class SalesRequest(BaseModel):
+    """Structured request sent from the orchestrator to the sales agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: str = Field(min_length=1, description="What the sales agent should do.")
+    items: List[SaleItem] = Field(min_length=1, description="Items to sell, with quoted prices.")
+    date: DateType = Field(
+        description="Transaction date in YYYY-MM-DD format; the goods must be available on this date."
+    )
+    quote_total: Optional[float] = Field(
+        default=None, description="total_amount of the quote; must equal the sum of the item prices."
+    )
+
+    @model_validator(mode="after")
+    def check_quote_total(self):
+        if self.quote_total is not None:
+            if abs(sum(i.total_price for i in self.items) - self.quote_total) > 0.01:
+                raise ValueError("quote_total must equal the sum of the item total_price values")
+        return self
+
+SALES_REQUEST_SCHEMA = json.dumps(SalesRequest.model_json_schema())
+
+class SaleResult(BaseModel):
+    """Outcome for one requested item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item: str
+    quantity: StrictInt
+    recorded: bool = Field(description="True only if the sale was recorded successfully.")
+    transaction_id: Optional[StrictInt] = Field(default=None, description="Set if recorded.")
+    total_price: Optional[float] = Field(default=None, description="Recorded price, set if recorded.")
+    reason: Optional[str] = Field(default=None, description="Why the item was not recorded.")
+
+    @model_validator(mode="after")
+    def check_recorded(self):
+        if self.recorded and (self.transaction_id is None or self.total_price is None):
+            raise ValueError("recorded items need transaction_id and total_price")
+        return self
+
+class SalesResponse(BaseModel):
+    """Structured response sent from the sales agent back to the orchestrator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "partial", "needs_info", "rejected", "failed"] = Field(
+        description="ok: all items recorded; partial: some recorded."
+    )
+    result: str = Field(description="Description of the work done.")
+    items: List[SaleResult] = Field(default_factory=list, description="One entry per requested item.")
+    total_recorded: float = Field(default=0.0, description="Sum of the recorded item prices.")
+
+    @model_validator(mode="after")
+    def check_consistency(self):
+        recorded = [i for i in self.items if i.recorded]
+        if self.status == "ok" and (not self.items or len(recorded) != len(self.items)):
+            raise ValueError("status ok requires all items to be recorded")
+        if self.status == "partial" and (not recorded or len(recorded) == len(self.items)):
+            raise ValueError("status partial requires some, but not all, items to be recorded")
+        if abs(sum(i.total_price for i in recorded) - self.total_recorded) > 0.01:
+            raise ValueError("total_recorded must equal the sum of recorded item prices")
+        return self
+
+SALES_RESPONSE_SCHEMA = json.dumps(SalesResponse.model_json_schema())
+
+class ReportRequest(BaseModel):
+    """Structured request sent from the orchestrator to the reporting agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: str = Field(min_length=1, description="Which report or figures are wanted.")
+    date: DateType = Field(description="As-of date in YYYY-MM-DD format.")
+
+REPORT_REQUEST_SCHEMA = json.dumps(ReportRequest.model_json_schema())
+
+class ReportResponse(BaseModel):
+    """Structured response sent from the reporting agent back to the orchestrator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "needs_info", "rejected", "failed"] = Field(
+        description="Outcome of the request."
+    )
+    result: str = Field(
+        description="The report text, including itemized inventory and top sellers if requested."
+    )
+    as_of_date: Optional[DateType] = Field(default=None, description="Date the report covers.")
+    cash_balance: Optional[float] = Field(default=None, description="Cash balance, if reported.")
+    inventory_value: Optional[float] = Field(default=None, description="Inventory value, if reported.")
+    total_assets: Optional[float] = Field(default=None, description="Total assets, if reported.")
+
+    @model_validator(mode="after")
+    def check_report(self):
+        if self.status == "ok" and self.as_of_date is None:
+            raise ValueError("as_of_date is required when status is ok")
+        figures = (self.cash_balance, self.inventory_value, self.total_assets)
+        if None not in figures and abs(self.cash_balance + self.inventory_value - self.total_assets) > 0.01:
+            raise ValueError("total_assets must equal cash_balance + inventory_value")
+        return self
+
+REPORT_RESPONSE_SCHEMA = json.dumps(ReportResponse.model_json_schema())
+
 class OrchestrationAgent(ToolCallingAgent):
     """
     Coordinates customer inquiries by selecting and calling the specialist best suited
@@ -793,29 +1097,70 @@ class OrchestrationAgent(ToolCallingAgent):
         "Delegate only the work that is relevant to the request.\n\n"
         "Choose a specialist as follows:\n"
         "- Call the inventory manager for on-hand stock, item availability, supplier "
-        "delivery estimates, and stock reorders.\n"
+        "delivery estimates, and stock reorders. Every inventory manager request must "
+        "be a JSON object that conforms to this JSON schema (no extra fields):\n"
+        f"{INVENTORY_REQUEST_SCHEMA}\n"
+        'Example: {"task": "Check on-hand stock", "item": "A4 paper", '
+        '"quantity": 500, "date": "2025-04-01"}\n'
+        "Requests with missing, extra, or wrongly typed fields are rejected; correct "
+        "them and call again.\n"
+        "The inventory manager replies with a JSON object that conforms to this JSON "
+        "schema:\n"
+        f"{INVENTORY_RESPONSE_SCHEMA}\n"
+        "Check status first; use stock_on_hand, shortfall, estimated_delivery_date, "
+        "order_placed, and total_price from the response instead of inferring them "
+        "from result.\n"
         "- Call the quote generator when a customer asks for a quote or pricing "
-        "guidance. Include relevant request details and any inventory findings.\n"
-        "- Call the sales agent only when a customer clearly authorizes a purchase and "
-        "the item, quantity, total price, and transaction date are known.\n"
+        "guidance. Call the inventory manager once per requested item first, then "
+        "send the quote generator a JSON object that conforms to this JSON schema, "
+        "filling stock_on_hand and estimated_delivery_date per item from the "
+        "inventory manager's responses:\n"
+        f"{QUOTE_REQUEST_SCHEMA}\n"
+        "Requests with missing, extra, or wrongly typed fields are rejected; correct "
+        "them and call again. The quote generator replies with a JSON object that "
+        "conforms to this JSON schema:\n"
+        f"{QUOTE_RESPONSE_SCHEMA}\n"
+        "Check status first; take total_amount and is_estimate from the response "
+        "instead of inferring them from result.\n"
+        "- Call the sales agent only when a customer clearly authorizes a purchase. "
+        "Send a JSON object that conforms to this JSON schema, taking each item's "
+        "total_price from the quote's line_items and quote_total from its "
+        "total_amount. If the quote has no per-item prices, ask the quote generator "
+        "for them first:\n"
+        f"{SALES_REQUEST_SCHEMA}\n"
+        "Requests with missing, extra, or wrongly typed fields are rejected; correct "
+        "them and call again. The sales agent replies with a JSON object that conforms "
+        "to this JSON schema:\n"
+        f"{SALES_RESPONSE_SCHEMA}\n"
+        "Check status first; treat a sale as recorded only for items with recorded=true.\n"
         "- Call the reporting agent for cash balances, inventory valuations, total "
-        "assets, or top-selling product reports.\n\n"
+        "assets, or top-selling product reports. Send a JSON object that conforms to "
+        "this JSON schema:\n"
+        f"{REPORT_REQUEST_SCHEMA}\n"
+        "Requests with missing, extra, or wrongly typed fields are rejected; correct "
+        "them and call again. The reporting agent replies with a JSON object that "
+        "conforms to this JSON schema:\n"
+        f"{REPORT_RESPONSE_SCHEMA}\n"
+        "Check status first; take cash_balance, inventory_value, and total_assets from "
+        "the structured fields and any other details from result.\n\n"
         "When forwarding a task to a specialist, always formulate a clear request that includes all relevant details and context. "
         "For a customer quote or purchase request that names an item and quantity, "
         "check on-hand stock with the inventory manager before quoting availability or "
         "asking the sales agent to record a sale. Reject a purchase request if the item is not in stock and the expected delivery date is higher than the customer-specified date. If the item is in stock, confirm the available quantity and any delivery estimate before quoting a price or recording a sale.\n\n"
-        "If delivery in time is realistic, call the inventory manager again and explicitly tell "
-        "it to place a stock order for the shortfall using tool_execute_order with "
-        'transaction_type="stock_orders". Pass along the item, shortfall quantity, '
-        "request or transaction date, and any supplier purchase price provided in the "
-        "request or context. Do not invent a missing price or date; have the inventory "
-        "manager request missing details, and do not say the order was placed unless "
-        "it confirms successful execution.\n\n"
-        "Treat newly ordered stock as incoming, not as currently on-hand. Use the "
+        "If delivery in time is realistic, call the inventory manager again with the "
+        "item, the full requested quantity, and the request date, and tell it to place a "
+        "stock order for the shortfall. It calculates the shortfall itself and dates the "
+        "order at the estimated delivery date. Do not pass a price; the inventory "
+        "manager determines the purchase price itself. Do not say the order was placed "
+        "unless the inventory manager confirms successful execution.\n\n"
+        "Ordered stock becomes available only on its estimated delivery date. Use the "
         "inventory manager's delivery estimate when explaining when it may become "
-        "available."
+        "available. Ask the sales agent to record a sale only when the goods are "
+        "available on the sale date: use the request date as date if the stock on hand "
+        "covers the quantity, or the estimated delivery date after a stock order was "
+        "placed. "
         "Include the stock and delivery findings (also dates) in any follow-up call to "
-        "the quote generator or sales agent.\n\n"
+        "the quote generator.\n\n"
         "Historical quotes are examples, not guarantees of current prices, discounts, "
         "or availability. Do not invent prices, discounts, stock, or delivery promises. "
         "Do not record a customer sale without clear authorization. Report actions as "
@@ -831,52 +1176,52 @@ class OrchestrationAgent(ToolCallingAgent):
         self.reporting_agent = ReportingAgent(model)
 
         @tool
-        def call_inventory_manager(request: str) -> str:
+        def call_inventory_manager(request: dict) -> str:
             """Delegate inventory and supplier delivery questions to the inventory manager.
 
             Args:
-                request: The inventory-related request.
+                request: Object with exactly the fields task (str), item (str), quantity (int), and date (YYYY-MM-DD).
 
             Returns:
-                The inventory manager's response.
+                The inventory manager's response as a JSON string conforming to InventoryResponse.
             """
-            return self.inventory_manager_agent.run(request)
+            return delegate(self.inventory_manager_agent, request, InventoryRequest, InventoryResponse)
 
         @tool
-        def call_quote_generator(request: str) -> str:
+        def call_quote_generator(request: dict) -> str:
             """Delegate customer quote requests to the quote generator.
 
             Args:
-                request: The customer's quote request.
+                request: Object with the fields task (str), items (list of objects with item (str) and quantity (int)), date (YYYY-MM-DD), and optionally job_type, order_size, event_type.
 
             Returns:
-                The quote generator's response.
+                The quote generator's response as a JSON string conforming to QuoteResponse.
             """
-            return self.quote_generator_agent.run(request)
+            return delegate(self.quote_generator_agent, request, QuoteRequest, QuoteResponse)
 
         @tool
-        def call_sales_agent(request: str) -> str:
-            """Delegate customer orders to the sales agent.
+        def call_sales_agent(request: dict) -> str:
+            """Delegate authorized customer purchases to the sales agent.
 
             Args:
-                request: The order or sales task to process.
+                request: Object with the fields task (str), items (list of objects with item (str), quantity (int), and total_price (float)), date (YYYY-MM-DD), and optionally quote_total (float).
 
             Returns:
-                The sales agent's response.
+                The sales agent's response as a JSON string conforming to SalesResponse.
             """
-            return self.sales_agent.run(request)
+            return delegate(self.sales_agent, request, SalesRequest, SalesResponse)
 
         @tool
-        def call_reporting_agent(request: str) -> str:
+        def call_reporting_agent(request: dict) -> str:
             """Delegate financial reporting requests to the reporting agent.
 
             Args:
-                request: The financial report request.
+                request: Object with exactly the fields task (str) and date (YYYY-MM-DD).
 
             Returns:
-                The reporting agent's response.
+                The reporting agent's response as a JSON string conforming to ReportResponse.
             """
-            return self.reporting_agent.run(request)
+            return delegate(self.reporting_agent, request, ReportRequest, ReportResponse)
 
         super().__init__(
             model=model,
@@ -900,14 +1245,30 @@ class InventoryManagerAgent(ToolCallingAgent):
     """
 
     PROMPT = (
+        "Each request is a JSON object that conforms to this JSON schema:\n"
+        f"{INVENTORY_REQUEST_SCHEMA}\n"
+        "Use date as the as-of date. "
         "Answer inventory questions using the inventory tools and the requested as-of "
-        "date. Report stock quantities accurately, and use the delivery timeline tool "
-        "when estimating arrival dates. Place a stock reorder when explicitly asked to "
-        "do so. Before ordering, make sure the item name, quantity, total purchase "
-        "price, and transaction date are known; ask for any missing details instead of "
+        "date, and report stock quantities accurately. If the stock on hand is below "
+        "the requested quantity, calculate the shortfall with the shortfall tool and "
+        "estimate the delivery date for the shortfall quantity, not the requested "
+        "quantity, with the delivery timeline tool, starting from the request date. "
+        "Place a stock reorder only when explicitly asked to do so, and order only the "
+        "shortfall. Before ordering, look up the item's unit price with the unit price "
+        "tool and use unit price times shortfall as the total purchase price; never "
+        "ask the requester for a price. Ask for any other missing details instead of "
         "guessing. Record the order with tool_execute_order using "
-        'transaction_type="stock_orders". Report that the reorder was placed only '
-        "after the tool confirms it. Do not use this process to record customer sales."
+        'transaction_type="stock_orders" and the estimated delivery date as the '
+        "transaction date, not the request date, so that the stock and the cash "
+        "outflow take effect on delivery. Report that the reorder was placed only "
+        "after the tool confirms it. Do not use this process to record customer sales.\n"
+        "Return your final answer as a JSON object that conforms to this JSON schema, "
+        "with item copied from the request:\n"
+        f"{INVENTORY_RESPONSE_SCHEMA}\n"
+        "Set order_placed to true only after tool_execute_order succeeds, and then also "
+        "set transaction_id and total_price, with estimated_delivery_date equal to the "
+        "order's transaction date. Use status needs_info if required details "
+        "are missing."
     )
 
     def __init__(self, model: OpenAIServerModel):
@@ -917,9 +1278,12 @@ class InventoryManagerAgent(ToolCallingAgent):
                 tool_check_inventory,
                 tool_check_stock_level,
                 tool_check_delivery_timeline,
+                tool_get_unit_price,
+                tool_calculate_shortfall,
                 tool_execute_order,
             ],
             instructions=self.PROMPT,
+            final_answer_checks=[make_final_answer_check(InventoryResponse)],
             name="inventory_manager_agent_01",
             description="Checks inventory, estimates delivery timelines, and places authorized stock reorders.",
         )
@@ -936,12 +1300,21 @@ class QuoteGeneratorAgent(ToolCallingAgent):
     """
 
     PROMPT = (
-        "Use the quote history tool to find relevant examples, then explain how they "
+        "Each request is a JSON object that conforms to this JSON schema:\n"
+        f"{QUOTE_REQUEST_SCHEMA}\n"
+        "Use the quote history tool to find relevant examples, using the item names "
+        "and any job_type, order_size, and event_type as search terms, then explain how they "
         "relate to the customer's request. Treat historical quotes as context, not as "
         "current prices. Apply only discount rules and prices provided in the request "
         "or other supplied context; do not invent prices or discounts. Ask for missing "
         "details needed to prepare a reliable quote, and make clear when a quote is "
-        "only an estimate."
+        "only an estimate.\n"
+        "Return your final answer as a JSON object that conforms to this JSON schema:\n"
+        f"{QUOTE_RESPONSE_SCHEMA}\n"
+        "Set total_amount only from the history and supplied context, and fill "
+        "line_items only if per-item prices can be derived from them. Use status "
+        "needs_info if details are missing or if the task asks for per-item prices "
+        "that cannot be derived."
     )
 
     def __init__(self, model: OpenAIServerModel):
@@ -949,6 +1322,7 @@ class QuoteGeneratorAgent(ToolCallingAgent):
             model=model,
             tools=[tool_read_quote_history],
             instructions=self.PROMPT,
+            final_answer_checks=[make_final_answer_check(QuoteResponse)],
             name="quote_generator_agent_01",
             description="Generates customer quotes using request details and relevant historical quotes.",
         )
@@ -963,11 +1337,20 @@ class SalesAgent(ToolCallingAgent):
     """
 
     PROMPT = (
-        "Before recording a sale, use the stock tool to verify the requested quantity "
-        "is available. Record a sale only when the customer has clearly authorized it "
-        "and the item, quantity, total price, and transaction date are known. Use "
-        'transaction_type="sales" for customer purchases. Do not invent prices or '
-        "promise a delivery date that has not been confirmed."
+        "Each request is a JSON object that conforms to this JSON schema:\n"
+        f"{SALES_REQUEST_SCHEMA}\n"
+        "Every request is an authorized customer purchase. "
+        "For each item, use the stock tool to verify the requested quantity is "
+        "available as of the date field. Record only the items that are in stock, "
+        "each with its own transaction, using the given total_price unchanged, and skip "
+        'the others with a reason. Use transaction_type="sales" for customer purchases. '
+        "Do not invent or change prices, and do not promise a delivery date that has "
+        "not been confirmed.\n"
+        "Return your final answer as a JSON object that conforms to this JSON schema:\n"
+        f"{SALES_RESPONSE_SCHEMA}\n"
+        "Set recorded to true only after tool_execute_order succeeds, and then also set "
+        "transaction_id and total_price. Use status partial if only some items were "
+        "recorded."
     )
 
     def __init__(self, model: OpenAIServerModel):
@@ -975,6 +1358,7 @@ class SalesAgent(ToolCallingAgent):
             model=model,
             tools=[tool_execute_order, tool_check_stock_level],
             instructions=self.PROMPT,
+            final_answer_checks=[make_final_answer_check(SalesResponse)],
             name="sales_agent_01",
             description="Processes customer orders, records sales, and checks stock availability.",
         )
@@ -990,18 +1374,26 @@ class ReportingAgent(ToolCallingAgent):
     """
 
     PROMPT = (
-        "Generate reports using the financial report tool and the requested as-of date. "
+        "Each request is a JSON object that conforms to this JSON schema:\n"
+        f"{REPORT_REQUEST_SCHEMA}\n"
+        "Generate reports using the financial report tool and the requested date as "
+        "the as-of date. "
         "Summarize cash balance, inventory value, and total assets; include itemized "
         "inventory or top-selling products when relevant. Clearly label the report date "
         "and distinguish reported figures from any interpretation. Do not infer values "
-        "the report does not provide."
+        "the report does not provide.\n"
+        "Return your final answer as a JSON object that conforms to this JSON schema:\n"
+        f"{REPORT_RESPONSE_SCHEMA}\n"
+        "Fill cash_balance, inventory_value, and total_assets only from the tools, and "
+        "put itemized inventory and top-selling products in result."
     )
 
     def __init__(self, model: OpenAIServerModel):
         super().__init__(
             model=model,
-            tools=[tool_generate_financial_report],
+            tools=[tool_generate_financial_report, tool_get_cash_balance],
             instructions=self.PROMPT,
+            final_answer_checks=[make_final_answer_check(ReportResponse)],
             name="reporting_agent_01",
             description="Generates financial reports on cash, inventory, and company assets.",
         )

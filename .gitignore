@@ -1,3 +1,7 @@
 .venv/
 .python-version
 .env
+
+run.log
+munder_difflin.db
+*.pyc
