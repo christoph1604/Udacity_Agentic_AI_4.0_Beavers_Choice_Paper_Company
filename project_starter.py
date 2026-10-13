@@ -966,16 +966,48 @@ def tool_generate_financial_report(as_of_date: Union[str, datetime]) -> Dict:
 # Set up your agents and create an orchestration agent that will manage them.
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+STRICT_JSON_FINAL_ANSWER_INSTRUCTION = (
+    "Return exactly one JSON object and nothing else: no prose, Markdown fences, or "
+    "text before or after the object."
+)
 
 def parse_model(model_cls: Type[ModelT], answer: Any) -> ModelT:
     """Parse an agent's final answer (dict or JSON string) into model_cls."""
     data = answer if isinstance(answer, dict) else json.loads(answer)
     return model_cls.model_validate(data)
 
+def _has_side_effecting_tool_call(memory: Any) -> bool:
+    return any(
+        getattr(tool_call, "name", None) == "tool_execute_order"
+        for step in getattr(memory, "steps", [])
+        for tool_call in (getattr(step, "tool_calls", None) or [])
+    )
+
 def make_final_answer_check(model_cls: Type[BaseModel]) -> Callable[..., bool]:
-    """Build a smolagents final-answer check; a failure is fed back to the agent so it retries."""
+    """Validate structured output and allow at most one safe correction attempt."""
     def check_final_answer(final_answer: Any, memory: Any, agent: Any = None) -> bool:
-        parse_model(model_cls, final_answer)
+        try:
+            parse_model(model_cls, final_answer)
+        except (json.JSONDecodeError, ValidationError, TypeError) as e:
+            error_message = (
+                f"Final answer must be {STRICT_JSON_FINAL_ANSWER_INSTRUCTION} "
+                f"It must validate as {model_cls.__name__}. Validation error: {e}"
+            )
+            if agent is None:
+                raise ValueError(error_message) from e
+
+            retry_count = getattr(agent, "_structured_response_retry_count", 0)
+            if retry_count >= 1 or _has_side_effecting_tool_call(memory):
+                agent._structured_response_retry_exhausted = True
+                agent.interrupt_switch = True
+                if _has_side_effecting_tool_call(memory):
+                    error_message += " No format retry was attempted after tool_execute_order ran."
+                else:
+                    error_message += " The single format-correction attempt was exhausted."
+            else:
+                agent._structured_response_retry_count = retry_count + 1
+                error_message += " Correct the format once; do not repeat completed tool actions."
+            raise ValueError(error_message) from e
         return True
     return check_final_answer
 
@@ -1027,20 +1059,41 @@ def delegate(
         )
         return response_json
     agent_request = validated.model_dump_json()
+    agent._structured_response_retry_count = 0
+    agent._structured_response_retry_exhausted = False
     try:
         answer = agent.run(agent_request)
-        response_json = parse_model(response_cls, answer).model_dump_json()
     except Exception as e:
+        invalid_response = getattr(agent, "_structured_response_retry_exhausted", False)
+        failure_type = "invalid structured response" if invalid_response else "execution failure"
         response_json = response_cls(
             status="failed",
-            result=f"{agent_name} did not return a valid response: {e}",
+            result=f"{agent_name} {failure_type}: {type(e).__name__}: {e}",
         ).model_dump_json()
         _record_handoff(
             "orchestrator",
             agent_name,
             agent_request,
             response_json,
-            "failed",
+            "invalid_response" if invalid_response else "failed",
+            started_at,
+            started_clock,
+        )
+        return response_json
+
+    try:
+        response_json = parse_model(response_cls, answer).model_dump_json()
+    except (json.JSONDecodeError, ValidationError, TypeError) as e:
+        response_json = response_cls(
+            status="failed",
+            result=f"{agent_name} returned an invalid structured response: {type(e).__name__}: {e}",
+        ).model_dump_json()
+        _record_handoff(
+            "orchestrator",
+            agent_name,
+            agent_request,
+            response_json,
+            "invalid_response",
             started_at,
             started_clock,
         )
@@ -1315,9 +1368,8 @@ class OrchestrationAgent(ToolCallingAgent):
         "Before calling the inventory manager, quote generator, or sales agent for a "
         "product, extract each product name and call tool_resolve_product_name. "
         "Proceed only with a canonical_name when status is matched, and use that exact "
-        "canonical name in every specialist request. If status is needs_clarification "
-        "or unknown, do not call those specialists for that product; ask the customer "
-        "to clarify or explain that no catalog product could be identified.\n\n"
+        "canonical name in every specialist request."
+        "If the product name cannot be resolved to a canonical name, proceed with the most probable product name.\n"
         "Choose a specialist as follows:\n"
         "- Call the inventory manager for on-hand stock, item availability, supplier "
         "delivery estimates, and stock reorders. Every inventory manager request must "
@@ -1489,6 +1541,7 @@ class InventoryManagerAgent(ToolCallingAgent):
         "Return your final answer as a JSON object that conforms to this JSON schema, "
         "with item copied from the request:\n"
         f"{INVENTORY_RESPONSE_SCHEMA}\n"
+        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION}\n"
         "Set order_placed to true only after tool_execute_order succeeds, and then also "
         "set transaction_id and total_price, with estimated_delivery_date equal to the "
         "order's transaction date. Use status needs_info if required details "
@@ -1508,6 +1561,7 @@ class InventoryManagerAgent(ToolCallingAgent):
             ],
             instructions=self.PROMPT,
             final_answer_checks=[make_final_answer_check(InventoryResponse)],
+            max_steps=10,
             name="inventory_manager_agent_01",
             description="Checks inventory, estimates delivery timelines, and places authorized stock reorders.",
         )
@@ -1535,6 +1589,7 @@ class QuoteGeneratorAgent(ToolCallingAgent):
         "only an estimate.\n"
         "Return your final answer as a JSON object that conforms to this JSON schema:\n"
         f"{QUOTE_RESPONSE_SCHEMA}\n"
+        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION}\n"
         "Set total_amount only from the history and supplied context, and fill "
         "line_items only if per-item prices can be derived from them. Use status "
         "needs_info if details are missing or if the task asks for per-item prices "
@@ -1547,6 +1602,7 @@ class QuoteGeneratorAgent(ToolCallingAgent):
             tools=[tool_read_quote_history],
             instructions=self.PROMPT,
             final_answer_checks=[make_final_answer_check(QuoteResponse)],
+            max_steps=6,
             name="quote_generator_agent_01",
             description="Generates customer quotes using request details and relevant historical quotes.",
         )
@@ -1572,6 +1628,7 @@ class SalesAgent(ToolCallingAgent):
         "not been confirmed.\n"
         "Return your final answer as a JSON object that conforms to this JSON schema:\n"
         f"{SALES_RESPONSE_SCHEMA}\n"
+        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION}\n"
         "Set recorded to true only after tool_execute_order succeeds, and then also set "
         "transaction_id and total_price. Use status partial if only some items were "
         "recorded."
@@ -1583,6 +1640,7 @@ class SalesAgent(ToolCallingAgent):
             tools=[tool_execute_order, tool_check_stock_level],
             instructions=self.PROMPT,
             final_answer_checks=[make_final_answer_check(SalesResponse)],
+            max_steps=12,
             name="sales_agent_01",
             description="Processes customer orders, records sales, and checks stock availability.",
         )
@@ -1608,6 +1666,7 @@ class ReportingAgent(ToolCallingAgent):
         "the report does not provide.\n"
         "Return your final answer as a JSON object that conforms to this JSON schema:\n"
         f"{REPORT_RESPONSE_SCHEMA}\n"
+        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION}\n"
         "Fill cash_balance, inventory_value, and total_assets only from the tools, and "
         "put itemized inventory and top-selling products in result."
     )
@@ -1618,6 +1677,7 @@ class ReportingAgent(ToolCallingAgent):
             tools=[tool_generate_financial_report, tool_get_cash_balance],
             instructions=self.PROMPT,
             final_answer_checks=[make_final_answer_check(ReportResponse)],
+            max_steps=6,
             name="reporting_agent_01",
             description="Generates financial reports on cash, inventory, and company assets.",
         )
