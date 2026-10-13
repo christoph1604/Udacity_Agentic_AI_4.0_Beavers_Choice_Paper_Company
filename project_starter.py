@@ -7,9 +7,12 @@ import ast
 import json
 import contextvars
 import logging
+import re
+import unicodedata
+from difflib import get_close_matches
 from sqlalchemy.sql import text
 from datetime import date as DateType, datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Literal, Optional, Type, TypeVar, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
 from sqlalchemy import create_engine, Engine
 from smolagents import ToolCallingAgent, OpenAIServerModel, load_dotenv, tool
@@ -132,6 +135,95 @@ paper_supplies = [
     {"item_name": "250 gsm cardstock",                "category": "specialty",    "unit_price": 0.30},
     {"item_name": "220 gsm poster paper",             "category": "specialty",    "unit_price": 0.35},
 ]
+
+
+def _normalize_product_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(re.sub(r"[^\w]+", " ", normalized).split())
+
+
+PRODUCT_NAME_ALIASES = {
+    "a4 sheet": "A4 paper",
+    "a4 sheets": "A4 paper",
+    "colored sheets": "Colored paper",
+    "colour paper": "Colored paper",
+    "copy paper": "Standard copy paper",
+    "glossy sheets": "Glossy paper",
+}
+_CANONICAL_PRODUCTS = {
+    _normalize_product_text(item["item_name"]): item["item_name"]
+    for item in paper_supplies
+}
+_NORMALIZED_PRODUCT_ALIASES = {
+    _normalize_product_text(alias): canonical_name
+    for alias, canonical_name in PRODUCT_NAME_ALIASES.items()
+}
+
+
+def _resolve_product_name(product_name: str) -> Dict[str, Any]:
+    normalized_name = _normalize_product_text(product_name)
+    canonical_name = _CANONICAL_PRODUCTS.get(normalized_name)
+    match_type = "canonical"
+
+    if canonical_name is None:
+        canonical_name = _NORMALIZED_PRODUCT_ALIASES.get(normalized_name)
+        match_type = "alias"
+
+    if canonical_name is not None:
+        return {
+            "status": "matched",
+            "requested_name": product_name,
+            "canonical_name": canonical_name,
+            "match_type": match_type,
+            "candidates": [],
+        }
+
+    similar_names = get_close_matches(
+        normalized_name,
+        list(_CANONICAL_PRODUCTS),
+        n=3,
+        cutoff=0.4,
+    )
+    candidates = [_CANONICAL_PRODUCTS[name] for name in similar_names]
+    return {
+        "status": "needs_clarification" if candidates else "unknown",
+        "requested_name": product_name,
+        "canonical_name": None,
+        "match_type": None,
+        "candidates": candidates,
+    }
+
+
+def _normalize_request_products(request_model: BaseModel) -> Tuple[BaseModel, Optional[str]]:
+    if hasattr(request_model, "item"):
+        original_names = [request_model.item]
+        field_name = "item"
+    elif hasattr(request_model, "items"):
+        original_names = [item.item for item in request_model.items]
+        field_name = "items"
+    else:
+        return request_model, None
+
+    canonical_names = []
+    for original_name in original_names:
+        resolution = _resolve_product_name(original_name)
+        if resolution["status"] != "matched":
+            candidates = resolution["candidates"]
+            candidate_text = f" Possible matches: {', '.join(candidates)}." if candidates else ""
+            return request_model, (
+                f"Could not safely identify product '{original_name}'.{candidate_text} "
+                "Ask the customer to clarify the product name before checking stock, quoting, or recording a sale."
+            )
+        canonical_names.append(resolution["canonical_name"])
+
+    if field_name == "item":
+        return request_model.model_copy(update={"item": canonical_names[0]}), None
+
+    normalized_items = [
+        item.model_copy(update={"item": canonical_name})
+        for item, canonical_name in zip(request_model.items, canonical_names)
+    ]
+    return request_model.model_copy(update={"items": normalized_items}), None
 
 # Given below are some utility functions you can use to implement your multi-agent system
 
@@ -679,6 +771,19 @@ model = OpenAIServerModel(
  and apply criteria to them to ensure that the flow of the system is correct."""
 
 
+@tool
+def tool_resolve_product_name(product_name: str) -> str:
+    """Resolve one customer product phrase to a canonical catalog name.
+
+    Args:
+        product_name: One extracted product name, without quantity or request text.
+
+    Returns:
+        JSON with status, canonical_name, match_type, and clarification candidates.
+    """
+    return json.dumps(_resolve_product_name(product_name), ensure_ascii=False)
+
+
 # Tools for inventory agent
 @tool
 def tool_check_inventory(as_of_date: str) -> Dict[str, int]:
@@ -901,6 +1006,22 @@ def delegate(
             request,
             response_json,
             "rejected",
+            started_at,
+            started_clock,
+        )
+        return response_json
+    validated, product_resolution_error = _normalize_request_products(validated)
+    if product_resolution_error is not None:
+        response_json = response_cls(
+            status="needs_info",
+            result=product_resolution_error,
+        ).model_dump_json()
+        _record_handoff(
+            "orchestrator",
+            agent_name,
+            request,
+            response_json,
+            "needs_clarification",
             started_at,
             started_clock,
         )
@@ -1191,6 +1312,12 @@ class OrchestrationAgent(ToolCallingAgent):
         "process thema and use them for further actions. "
         "Use the input from the specialists' responses for your reply to the customer."
         "Delegate only the work that is relevant to the request.\n\n"
+        "Before calling the inventory manager, quote generator, or sales agent for a "
+        "product, extract each product name and call tool_resolve_product_name. "
+        "Proceed only with a canonical_name when status is matched, and use that exact "
+        "canonical name in every specialist request. If status is needs_clarification "
+        "or unknown, do not call those specialists for that product; ask the customer "
+        "to clarify or explain that no catalog product could be identified.\n\n"
         "Choose a specialist as follows:\n"
         "- Call the inventory manager for on-hand stock, item availability, supplier "
         "delivery estimates, and stock reorders. Every inventory manager request must "
@@ -1322,6 +1449,7 @@ class OrchestrationAgent(ToolCallingAgent):
         super().__init__(
             model=model,
             tools=[
+                tool_resolve_product_name,
                 call_inventory_manager,
                 call_quote_generator,
                 call_sales_agent,
@@ -1508,6 +1636,7 @@ def run_test_scenarios():
         )
         quote_requests_sample.dropna(subset=["request_date"], inplace=True)
         quote_requests_sample = quote_requests_sample.sort_values("request_date")
+        #quote_requests_sample = quote_requests_sample.sort_values("request_date").head(1)
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
