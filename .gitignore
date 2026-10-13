@@ -3,5 +3,6 @@
 .env
 
 run.log
+handoff_trace.jsonl
 munder_difflin.db
 *.pyc

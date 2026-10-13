@@ -5,12 +5,73 @@ import time
 import dotenv
 import ast
 import json
+import contextvars
+import logging
 from sqlalchemy.sql import text
-from datetime import date as DateType, datetime, timedelta
+from datetime import date as DateType, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional, Type, TypeVar, Union
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
 from sqlalchemy import create_engine, Engine
 from smolagents import ToolCallingAgent, OpenAIServerModel, load_dotenv, tool
+from uuid import uuid4
+
+HANDOFF_TRACE_FILE = "handoff_trace.jsonl"
+_HANDOFF_RUN_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "handoff_run_id", default=None
+)
+_HANDOFF_REQUEST_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "handoff_request_id", default=None
+)
+_HANDOFF_SEQUENCE: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "handoff_sequence", default=0
+)
+
+
+def _get_handoff_logger() -> logging.Logger:
+    logger = logging.getLogger("beavers_choice.handoff_trace")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    trace_path = os.path.abspath(HANDOFF_TRACE_FILE)
+    if not any(
+        isinstance(handler, logging.FileHandler) and handler.baseFilename == trace_path
+        for handler in logger.handlers
+    ):
+        handler = logging.FileHandler(trace_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+
+    return logger
+
+
+def _record_handoff(
+    source: str,
+    destination: str,
+    request: Any,
+    response: Any,
+    outcome: str,
+    started_at: datetime,
+    started_clock: float,
+) -> None:
+    sequence = _HANDOFF_SEQUENCE.get() + 1
+    _HANDOFF_SEQUENCE.set(sequence)
+    completed_at = datetime.now(timezone.utc)
+    record = {
+        "event": "handoff",
+        "event_id": uuid4().hex,
+        "run_id": _HANDOFF_RUN_ID.get(),
+        "request_id": _HANDOFF_REQUEST_ID.get(),
+        "sequence": sequence,
+        "source": source,
+        "destination": destination,
+        "request": request,
+        "response": response,
+        "outcome": outcome,
+        "started_at": started_at.isoformat(),
+        "completed_at": completed_at.isoformat(),
+        "elapsed_ms": round((time.perf_counter() - started_clock) * 1000, 3),
+    }
+    _get_handoff_logger().info(json.dumps(record, ensure_ascii=False, default=str))
 
 # Create an SQLite database
 db_engine = create_engine("sqlite:///munder_difflin.db")
@@ -820,25 +881,60 @@ def delegate(
     response_cls: Type[BaseModel],
 ) -> str:
     """Validate the request, run the agent, and return its validated response as JSON."""
+    started_at = datetime.now(timezone.utc)
+    started_clock = time.perf_counter()
+    agent_name = getattr(agent, "name", type(agent).__name__)
     try:
         validated = request_cls.model_validate(request)
     except ValidationError as e:
         schema = json.dumps(request_cls.model_json_schema())
-        return response_cls(
+        response_json = response_cls(
             status="rejected",
             result=(
                 f"Request must conform to this JSON schema: {schema}. "
                 f"Errors: {e.errors(include_url=False, include_input=False)}"
             ),
         ).model_dump_json()
+        _record_handoff(
+            "orchestrator",
+            agent_name,
+            request,
+            response_json,
+            "rejected",
+            started_at,
+            started_clock,
+        )
+        return response_json
+    agent_request = validated.model_dump_json()
     try:
-        answer = agent.run(validated.model_dump_json())
-        return parse_model(response_cls, answer).model_dump_json()
+        answer = agent.run(agent_request)
+        response_json = parse_model(response_cls, answer).model_dump_json()
     except Exception as e:
-        return response_cls(
+        response_json = response_cls(
             status="failed",
-            result=f"{agent.name} did not return a valid response: {e}",
+            result=f"{agent_name} did not return a valid response: {e}",
         ).model_dump_json()
+        _record_handoff(
+            "orchestrator",
+            agent_name,
+            agent_request,
+            response_json,
+            "failed",
+            started_at,
+            started_clock,
+        )
+        return response_json
+
+    _record_handoff(
+        "orchestrator",
+        agent_name,
+        agent_request,
+        response_json,
+        "completed",
+        started_at,
+        started_clock,
+    )
+    return response_json
 
 class InventoryRequest(BaseModel):
     """Structured request sent from the orchestrator to the inventory manager."""
@@ -1431,6 +1527,7 @@ def run_test_scenarios():
     ############
 
     multi_agent_system_orchestrator = OrchestrationAgent(model)
+    trace_run_id = uuid4().hex
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
@@ -1453,7 +1550,38 @@ def run_test_scenarios():
         ############
         ############
 
-        response = multi_agent_system_orchestrator.run(request_with_date)
+        run_token = _HANDOFF_RUN_ID.set(trace_run_id)
+        request_token = _HANDOFF_REQUEST_ID.set(str(idx + 1))
+        sequence_token = _HANDOFF_SEQUENCE.set(0)
+        started_at = datetime.now(timezone.utc)
+        started_clock = time.perf_counter()
+        try:
+            response = multi_agent_system_orchestrator.run(request_with_date)
+        except Exception as e:
+            _record_handoff(
+                "test_runner",
+                "orchestrator",
+                request_with_date,
+                {"error_type": type(e).__name__, "error": str(e)},
+                "failed",
+                started_at,
+                started_clock,
+            )
+            raise
+        else:
+            _record_handoff(
+                "test_runner",
+                "orchestrator",
+                request_with_date,
+                response,
+                "completed",
+                started_at,
+                started_clock,
+            )
+        finally:
+            _HANDOFF_SEQUENCE.reset(sequence_token)
+            _HANDOFF_REQUEST_ID.reset(request_token)
+            _HANDOFF_RUN_ID.reset(run_token)
 
         # Update state
         report = generate_financial_report(request_date)
