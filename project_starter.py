@@ -160,6 +160,13 @@ _NORMALIZED_PRODUCT_ALIASES = {
 }
 
 
+_GENERIC_WORDS = {"paper", "sheet", "sheets", "of", "and", "the", "with"}
+
+
+def _product_tokens(normalized_name: str) -> set:
+    return {t.rstrip("s") for t in normalized_name.split() if t not in _GENERIC_WORDS}
+
+
 def _resolve_product_name(product_name: str) -> Dict[str, Any]:
     normalized_name = _normalize_product_text(product_name)
     canonical_name = _CANONICAL_PRODUCTS.get(normalized_name)
@@ -182,9 +189,15 @@ def _resolve_product_name(product_name: str) -> Dict[str, Any]:
         normalized_name,
         list(_CANONICAL_PRODUCTS),
         n=3,
-        cutoff=0.4,
+        cutoff=0.75,
     )
-    candidates = [_CANONICAL_PRODUCTS[name] for name in similar_names]
+    # A candidate must also share a meaningful word, so unrelated products stay unknown.
+    requested_tokens = _product_tokens(normalized_name)
+    candidates = [
+        _CANONICAL_PRODUCTS[name]
+        for name in similar_names
+        if requested_tokens & _product_tokens(name)
+    ]
     return {
         "status": "needs_clarification" if candidates else "unknown",
         "requested_name": product_name,
@@ -194,7 +207,7 @@ def _resolve_product_name(product_name: str) -> Dict[str, Any]:
     }
 
 
-def _normalize_request_products(request_model: BaseModel) -> Tuple[BaseModel, Optional[str]]:
+def _normalize_request_products(request_model: BaseModel) -> Tuple[BaseModel, Optional[str], str]:
     if hasattr(request_model, "item"):
         original_names = [request_model.item]
         field_name = "item"
@@ -202,28 +215,33 @@ def _normalize_request_products(request_model: BaseModel) -> Tuple[BaseModel, Op
         original_names = [item.item for item in request_model.items]
         field_name = "items"
     else:
-        return request_model, None
+        return request_model, None, ""
 
     canonical_names = []
     for original_name in original_names:
         resolution = _resolve_product_name(original_name)
         if resolution["status"] != "matched":
             candidates = resolution["candidates"]
-            candidate_text = f" Possible matches: {', '.join(candidates)}." if candidates else ""
+            if not candidates:
+                return request_model, (
+                    f"Product '{original_name}' is not in our portfolio. "
+                    "Reject the whole request with a brief apology."
+                ), "rejected"
             return request_model, (
-                f"Could not safely identify product '{original_name}'.{candidate_text} "
+                f"Could not safely identify product '{original_name}'. "
+                f"Possible matches: {', '.join(candidates)}. "
                 "Ask the customer to clarify the product name before checking stock, quoting, or recording a sale."
-            )
+            ), "needs_info"
         canonical_names.append(resolution["canonical_name"])
 
     if field_name == "item":
-        return request_model.model_copy(update={"item": canonical_names[0]}), None
+        return request_model.model_copy(update={"item": canonical_names[0]}), None, ""
 
     normalized_items = [
         item.model_copy(update={"item": canonical_name})
         for item, canonical_name in zip(request_model.items, canonical_names)
     ]
-    return request_model.model_copy(update={"items": normalized_items}), None
+    return request_model.model_copy(update={"items": normalized_items}), None, ""
 
 # Given below are some utility functions you can use to implement your multi-agent system
 
@@ -800,7 +818,7 @@ def tool_check_inventory(as_of_date: str) -> Dict[str, int]:
     return {item: int(stock) for item, stock in inventory_info.items()}
 
 @tool
-def tool_check_stock_level(item_name: str, as_of_date: str) -> int:
+def tool_check_stock_level(item_name: str, as_of_date: str) -> Dict[str, Any]:
     """
     Tool for checking the stock level of a specific item as of a given date.
 
@@ -809,10 +827,11 @@ def tool_check_stock_level(item_name: str, as_of_date: str) -> int:
         as_of_date (str): The date (in ISO format) to check the stock level.
 
     Returns:
-        int: The current stock level of the specified item.
+        Dict[str, Any]: The item name and its current stock level, e.g. {"item": "A4 paper", "stock": 272}.
     """
     stock_info = get_stock_level(item_name, as_of_date)
-    return int(stock_info["current_stock"].iloc[0]) if not stock_info.empty else 0
+    stock = int(stock_info["current_stock"].iloc[0]) if not stock_info.empty else 0
+    return {"item": item_name, "stock": stock}
 
 @tool
 def tool_check_delivery_timeline(input_date: str, quantity: int) -> str:
@@ -848,19 +867,37 @@ def tool_get_unit_price(item_name: str) -> float:
         raise ValueError(f"Unknown item: {item_name}")
     return float(result["unit_price"].iloc[0])
 
+_CALC_OPS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: a / b,
+    ast.USub: lambda a: -a,
+}
+
+def _eval_node(node: ast.AST) -> float:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _CALC_OPS:
+        return _CALC_OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _CALC_OPS:
+        return _CALC_OPS[type(node.op)](_eval_node(node.operand))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("max", "min", "round"):
+        return {"max": max, "min": min, "round": round}[node.func.id](*[_eval_node(a) for a in node.args])
+    raise ValueError("Unsupported expression")
+
 @tool
-def tool_calculate_shortfall(requested_quantity: int, stock_on_hand: int) -> int:
+def tool_calculator(expression: str) -> float:
     """
-    Tool for calculating how many units are missing to cover a requested quantity.
+    Tool for evaluating an arithmetic expression, e.g. "max(500 - 272, 0)" or "0.1 * 200 + 5.5".
 
     Args:
-        requested_quantity (int): The number of units requested.
-        stock_on_hand (int): The number of units on hand.
+        expression (str): Expression using numbers, + - * /, parentheses, max, min and round.
 
     Returns:
-        int: The missing units, or 0 if the stock covers the request.
+        float: The result of the expression.
     """
-    return max(requested_quantity - stock_on_hand, 0)
+    return _eval_node(ast.parse(expression, mode="eval").body)
 
 # Tools for quoting agent
 @tool
@@ -1042,10 +1079,10 @@ def delegate(
             started_clock,
         )
         return response_json
-    validated, product_resolution_error = _normalize_request_products(validated)
+    validated, product_resolution_error, resolution_status = _normalize_request_products(validated)
     if product_resolution_error is not None:
         response_json = response_cls(
-            status="needs_info",
+            status=resolution_status,
             result=product_resolution_error,
         ).model_dump_json()
         _record_handoff(
@@ -1053,7 +1090,7 @@ def delegate(
             agent_name,
             request,
             response_json,
-            "needs_clarification",
+            "rejected" if resolution_status == "rejected" else "needs_clarification",
             started_at,
             started_clock,
         )
@@ -1210,21 +1247,14 @@ class QuoteResponse(BaseModel):
         description="How the quote history was used, and what is assumed or missing."
     )
     is_estimate: bool = Field(default=True, description="True if the quote is only an estimate.")
-    total_amount: Optional[float] = Field(
-        default=None, description="Total quoted amount in dollars; required when status is ok."
-    )
     line_items: List[QuoteLineItem] = Field(
-        default_factory=list, description="Per-item prices, only if they can be derived from the context."
+        default_factory=list, description="Per-item prices; required when status is ok."
     )
 
     @model_validator(mode="after")
-    def check_totals(self):
-        if self.status == "ok" and self.total_amount is None:
-            raise ValueError("total_amount is required when status is ok")
-        totals = [li.line_total for li in self.line_items]
-        if self.total_amount is not None and totals and None not in totals:
-            if abs(sum(totals) - self.total_amount) > 0.01:
-                raise ValueError("line_total values must sum to total_amount")
+    def check_line_items(self):
+        if self.status == "ok" and not self.line_items:
+            raise ValueError("line_items are required when status is ok")
         return self
 
 QUOTE_RESPONSE_SCHEMA = json.dumps(QuoteResponse.model_json_schema())
@@ -1252,7 +1282,7 @@ class SalesRequest(BaseModel):
         )
     )
     quote_total: Optional[float] = Field(
-        default=None, description="total_amount of the quote; must equal the sum of the item prices."
+        default=None, description="Quote total calculated by the orchestrator; must equal the sum of the item prices."
     )
 
     @model_validator(mode="after")
@@ -1287,8 +1317,8 @@ class SalesResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["ok", "partial", "needs_info", "rejected", "failed"] = Field(
-        description="ok: all items recorded; partial: some recorded."
+    status: Literal["ok", "needs_info", "rejected", "failed"] = Field(
+        description="ok: all items recorded; otherwise no item is recorded."
     )
     result: str = Field(description="Description of the work done.")
     items: List[SaleResult] = Field(default_factory=list, description="One entry per requested item.")
@@ -1299,8 +1329,8 @@ class SalesResponse(BaseModel):
         recorded = [i for i in self.items if i.recorded]
         if self.status == "ok" and (not self.items or len(recorded) != len(self.items)):
             raise ValueError("status ok requires all items to be recorded")
-        if self.status == "partial" and (not recorded or len(recorded) == len(self.items)):
-            raise ValueError("status partial requires some, but not all, items to be recorded")
+        if self.status != "ok" and recorded:
+            raise ValueError("sales must be all-or-nothing: only status ok may have recorded items")
         if abs(sum(i.total_price for i in recorded) - self.total_recorded) > 0.01:
             raise ValueError("total_recorded must equal the sum of recorded item prices")
         return self
@@ -1372,10 +1402,14 @@ class OrchestrationAgent(ToolCallingAgent):
         "process thema and use them for further actions. "
         "Use the input from the specialists' responses for your reply to the customer."
         "Delegate only the work that is relevant to the request."
-        "Execute as many sales as possible! If a customer request can be fulfilled, COMPLETE THE SALE!\n\n"
+        "Requests are all-or-nothing: if every item of a customer request can be fulfilled, "
+        "COMPLETE THE SALE for all items; if any item cannot be fulfilled, reject the whole "
+        "request with a brief apology and do not quote or sell any part of it.\n\n"
         "Before calling the inventory manager, quote generator, or sales agent for a "
         "product, extract each product name and call tool_resolve_product_name. "
-        "Proceed with the canonical name or (if unresolved) the most probable product name.\n"
+        "Proceed only with a resolved canonical name. If the status is unknown, do not "
+        "delegate; reject the whole request with a brief apology. If it is "
+        "needs_clarification, ask the customer which of the candidates they mean.\n"
         "Choose a specialist as follows:\n"
         "- Call the inventory manager for on-hand stock, item availability, supplier "
         "delivery estimates, and stock reorders. Every inventory manager request must "
@@ -1398,18 +1432,20 @@ class OrchestrationAgent(ToolCallingAgent):
         "The quote generator replies with a JSON object that "
         "conforms to this JSON schema:\n"
         f"{QUOTE_RESPONSE_SCHEMA}\n"
-        "Check status first; take total_amount and is_estimate from the response "
-        "instead of inferring them from result.\n"
+        "Check status first; take is_estimate and line_items from the response. The "
+        "quote generator does not give a total: calculate the total_amount yourself as "
+        "the sum of the line_total values, using tool_calculator.\n"
         "- Call the sales agent when a purchase is possible. "
         "Send a JSON object that conforms to this JSON schema, taking each item's "
-        "total_price from the quote's line_items and quote_total from its "
-        "total_amount. If the quote has no per-item prices, ask the quote generator "
+        "total_price from the quote's line_items and quote_total from the total_amount "
+        "you calculated. If the quote has no per-item prices, ask the quote generator "
         "for them first:\n"
         f"{SALES_REQUEST_SCHEMA}\n"
         "The sales agent replies with a JSON object that conforms "
         "to this JSON schema:\n"
         f"{SALES_RESPONSE_SCHEMA}\n"
-        "Check status first; treat a sale as recorded only for items with recorded=true.\n"
+        "Check status first; a sale is recorded only if status is ok. Otherwise tell the "
+        "customer that nothing was ordered and why.\n"
         "- Call the reporting agent for cash balances, inventory valuations, total "
         "assets, or top-selling product reports. Send a JSON object that conforms to "
         "this JSON schema:\n"
@@ -1426,25 +1462,31 @@ class OrchestrationAgent(ToolCallingAgent):
         "a sale. Include in the task any delivery deadline and whether shortfall "
         "reorders are authorized. The inventory manager checks stock, estimates any "
         "shortfall delivery, and places authorized orders in that same run, but only "
-        "when the estimate meets the customer's deadline. Never call it again for "
-        "individual items or to place follow-up orders. Use the request date as the "
-        "posting date for stock orders and sales. If a shortfall's estimate misses "
-        "the deadline, do not proceed with the purchase. After an order is confirmed, "
-        "a sale may be recorded with the request date.\n\n"
+        "when the estimate meets the customer's requested delivery date. If any "
+        "out-of-stock item would arrive after that date, do not quote or record any "
+        "part of the purchase; reject the request with a brief apology and explain "
+        "that it cannot arrive by the requested date. Never call the inventory "
+        "manager again for individual items or follow-up orders. Use the request date "
+        "as the posting date for stock orders and sales.\n\n"
         "Do not pass a price; the inventory "
         "manager determines the purchase price itself. Do not say the order was placed "
         "unless the inventory manager confirms successful execution.\n\n"
-        "For this example, after the inventory manager confirms a reorder, treat the "
-        "ordered quantity as available for a sale posted on the request date, even if "
-        "the estimated arrival is later. Use the estimated delivery date only to check "
-        "the customer's deadline and explain expected arrival. Include the stock and "
-        "delivery findings (including dates) in any follow-up call to "
+        "For this example, after the inventory manager confirms a reorder that meets "
+        "the customer's requested delivery date, treat the ordered quantity as "
+        "available for a sale posted on the request date, even if the estimated "
+        "arrival is later than the request date. Never use this assumption when the "
+        "estimated arrival misses the customer's requested delivery date. Include "
+        "the stock and delivery findings (including dates) in any follow-up call to "
         "the quote generator.\n\n"
+        "Always use tool_calculator for any arithmetic; never calculate in your head.\n\n"
         "Historical quotes are examples, not guarantees of current prices, discounts, "
         "or availability. Do not invent prices, discounts, stock, or delivery promises. "
         "Report actions as "
         "completed only after the responsible agent confirms them; otherwise explain "
-        "what is pending or what information is needed."
+        "what is pending or what information is needed.\n\n"
+        "Your reply to the customer is short and only contains what matters to them: "
+        "the outcome, items, quantities, prices and delivery dates. Never mention "
+        "transaction IDs, tools, agents, or other internal details."
     )
 
     def __init__(self, model: OpenAIServerModel):
@@ -1506,6 +1548,7 @@ class OrchestrationAgent(ToolCallingAgent):
             model=model,
             tools=[
                 tool_resolve_product_name,
+                tool_calculator,
                 call_inventory_manager,
                 call_quote_generator,
                 call_sales_agent,
@@ -1536,11 +1579,13 @@ class InventoryManagerAgent(ToolCallingAgent):
         "quantity. Check stock as of the requested date and return exactly one result "
         "for each requested item. Do not repeat completed tool calls.\n"
         "2. For each item whose stock is below its requested quantity, calculate the "
-        "shortfall once and estimate delivery for that shortfall from the request date. "
+        "shortfall once with tool_calculator and estimate delivery for that shortfall from the request date. "
         "For items with sufficient stock, do not calculate a shortfall or delivery date.\n"
         "3. Place stock reorders only when the task explicitly authorizes them, and order "
-        "only each item's shortfall. If the task includes a delivery deadline, do not "
-        "place an order whose estimated arrival misses that deadline. Before ordering, "
+        "only each item's shortfall. If the task includes the customer's requested "
+        "delivery date and any item's estimated arrival is later, place no order for "
+        "any item. Leave order_placed false for all items and report the shortfalls and "
+        "estimated arrivals so the orchestrator can reject the whole request. Before ordering, "
         "look up each item's unit price with the unit price "
         "tool and use unit price times shortfall as the total purchase price; never ask "
         "the requester for a price. Ask for any other missing details instead of "
@@ -1578,7 +1623,7 @@ class InventoryManagerAgent(ToolCallingAgent):
                 tool_check_stock_level,
                 tool_check_delivery_timeline,
                 tool_get_unit_price,
-                tool_calculate_shortfall,
+                tool_calculator,
                 tool_execute_order,
             ],
             instructions=self.PROMPT,
@@ -1610,8 +1655,12 @@ class QuoteGeneratorAgent(ToolCallingAgent):
         "- Use the most relevant past quotes to estimate a clear total for this request. "
         "Use past per-item prices when available; otherwise use a similar past quote "
         "as the estimate and briefly explain the comparison.\n"
-        "- Treat every price based on history as an estimate. Do not invent prices or "
-        "discounts. If no useful quote is found, use status needs_info and say why.\n\n"
+        "- Use tool_calculator for every calculation, e.g. line_total = unit_price * quantity. "
+        "Do not give a total for the whole quote; the orchestrator calculates it.\n"
+        "- Treat every price based on history as an estimate. Do not invent discounts. "
+        "Always give a price for every item: if the history has none for an item, "
+        "search for similar products and estimate from their prices, and as a last "
+        "resort use the item's catalog unit price. Say in result how it was estimated.\n\n"
         "## Output\n"
         "Finish by calling final_answer with a JSON string that conforms to this JSON "
         "schema:\n"
@@ -1620,19 +1669,18 @@ class QuoteGeneratorAgent(ToolCallingAgent):
         "Put any human-readable explanation in the result field; never pass plain text "
         "to final_answer.\n"
         "- For a quote based on history, use status ok and is_estimate true. Include "
-        "the estimated total_amount and per-item line_items when the history supports "
-        "them; make line totals and the total agree.\n\n"
+        "per-item line_items with unit_price and line_total.\n\n"
         "Example final_answer argument for an estimate based on quote history:\n"
         '{"status": "ok", "result": "Based on similar past ceremony quotes, the '
         'estimate is $20.00 for 200 sheets of A4 paper; no discount was supplied.", '
-        '"is_estimate": true, "total_amount": 20.0, "line_items": [{"item": "A4 paper", '
+        '"is_estimate": true, "line_items": [{"item": "A4 paper", '
         '"quantity": 200, "unit_price": 0.1, "line_total": 20.0}]}'
     )
 
     def __init__(self, model: OpenAIServerModel):
         super().__init__(
             model=model,
-            tools=[tool_read_quote_history],
+            tools=[tool_read_quote_history, tool_get_unit_price, tool_calculator],
             instructions=self.PROMPT,
             final_answer_checks=[make_final_answer_check(QuoteResponse)],
             max_steps=6,
@@ -1656,12 +1704,14 @@ class SalesAgent(ToolCallingAgent):
         f"{SALES_REQUEST_SCHEMA}\n"
         "Every request is an authorized customer purchase.\n\n"
         "## Rules\n"
-        "- Record an item only if the stock tool confirms the requested quantity is "
-        "available as of the request date in the date field. Use that same date for "
-        "the sale transaction, including when stock was reordered with that date. "
-        "Skip the other items and give a reason.\n"
+        "- A request is all-or-nothing. First check the stock of every item as of the "
+        "request date in the date field. If any item lacks the requested quantity, "
+        "record nothing, use status rejected and give a reason for each item. Only if "
+        "all items are available, record all of them, using that same date for the "
+        "sale transactions, including when stock was reordered with that date.\n"
         "- Record each item as its own transaction with transaction_type=\"sales\" "
         "and the given total_price unchanged.\n"
+        "- Use tool_calculator for any calculation, e.g. total_recorded.\n"
         "- Never invent or change prices, and do not promise a delivery date that has "
         "not been confirmed.\n"
         "- Report an item as recorded only after tool_execute_order succeeds.\n\n"
@@ -1673,22 +1723,22 @@ class SalesAgent(ToolCallingAgent):
         "Put any human-readable summary in the result field; never pass plain text to "
         "final_answer.\n"
         "- Add one entry in items per requested item. A recorded item needs "
-        "transaction_id and total_price; a skipped item needs a reason.\n"
-        "- Status ok: all items recorded; partial: only some recorded. "
-        "total_recorded is the sum of the recorded prices.\n\n"
+        "transaction_id and total_price; a non-recorded item needs a reason.\n"
+        "- Status ok: all items recorded; rejected: none recorded. "
+        "total_recorded is the sum of the recorded prices (0 if none).\n\n"
         "Example final_answer argument when one of two items was out of stock:\n"
-        '{"status": "partial", "result": "Recorded A4 paper; poster paper is out of '
-        'stock.", "items": [{"item": "A4 paper", "quantity": 200, "recorded": true, '
-        '"transaction_id": 42, "total_price": 20.0, "reason": null}, '
+        '{"status": "rejected", "result": "Nothing recorded; poster paper is out of '
+        'stock.", "items": [{"item": "A4 paper", "quantity": 200, "recorded": false, '
+        '"transaction_id": null, "total_price": null, "reason": "Not recorded because another item is unavailable"}, '
         '{"item": "Poster paper", "quantity": 50, "recorded": false, '
         '"transaction_id": null, "total_price": null, "reason": "Insufficient stock"}], '
-        '"total_recorded": 20.0}'
+        '"total_recorded": 0.0}'
     )
 
     def __init__(self, model: OpenAIServerModel):
         super().__init__(
             model=model,
-            tools=[tool_execute_order, tool_check_stock_level],
+            tools=[tool_execute_order, tool_check_stock_level, tool_calculator],
             instructions=self.PROMPT,
             final_answer_checks=[make_final_answer_check(SalesResponse)],
             max_steps=12,
@@ -1713,6 +1763,7 @@ class ReportingAgent(ToolCallingAgent):
         f"{REPORT_REQUEST_SCHEMA}\n"
         "Use date as the as-of date.\n\n"
         "## Rules\n"
+        "- Use tool_calculator for any calculation, e.g. total assets.\n"
         "- Base every figure on the financial report and cash balance tools; do not "
         "infer or invent values the tools do not provide.\n"
         "- Summarize cash balance, inventory value and total assets, and include "
@@ -1739,7 +1790,7 @@ class ReportingAgent(ToolCallingAgent):
     def __init__(self, model: OpenAIServerModel):
         super().__init__(
             model=model,
-            tools=[tool_generate_financial_report, tool_get_cash_balance],
+            tools=[tool_generate_financial_report, tool_get_cash_balance, tool_calculator],
             instructions=self.PROMPT,
             final_answer_checks=[make_final_answer_check(ReportResponse)],
             max_steps=6,
@@ -1761,8 +1812,7 @@ def run_test_scenarios():
         )
         quote_requests_sample.dropna(subset=["request_date"], inplace=True)
         #quote_requests_sample = quote_requests_sample.sort_values("request_date")
-        #quote_requests_sample = quote_requests_sample.sort_values("request_date").head(1)
-        quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[1]]
+        quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[0]]
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
