@@ -1106,7 +1106,9 @@ class InventoryRequest(BaseModel):
     )
     item: str = Field(min_length=1, description="Exact item name.")
     quantity: StrictInt = Field(gt=0, description="Number of units, as an integer.")
-    date: DateType = Field(description="Transaction or as-of date in YYYY-MM-DD format.")
+    date: DateType = Field(
+        description="Request date in YYYY-MM-DD format; use it as the stock-check cutoff and transaction posting date."
+    )
 
 INVENTORY_REQUEST_SCHEMA = json.dumps(InventoryRequest.model_json_schema())
 
@@ -1127,7 +1129,8 @@ class InventoryResponse(BaseModel):
         default=None, description="Requested units not covered by stock on hand, if calculated."
     )
     estimated_delivery_date: Optional[DateType] = Field(
-        default=None, description="Estimated supplier delivery date (YYYY-MM-DD) for the shortfall, if estimated."
+        default=None,
+        description="Estimated supplier arrival date (YYYY-MM-DD) for the shortfall; this is not the transaction posting date.",
     )
     order_placed: bool = Field(
         default=False, description="True only if a stock order was recorded successfully."
@@ -1227,7 +1230,10 @@ class SalesRequest(BaseModel):
     task: str = Field(min_length=1, description="What the sales agent should do.")
     items: List[SaleItem] = Field(min_length=1, description="Items to sell, with quoted prices.")
     date: DateType = Field(
-        description="Transaction date in YYYY-MM-DD format; the goods must be available on this date."
+        description=(
+            "Request/booking date in YYYY-MM-DD format. Use this date for the stock check "
+            "and sale transaction, including when a confirmed reorder has a later estimated arrival."
+        )
     )
     quote_total: Optional[float] = Field(
         default=None, description="total_amount of the quote; must equal the sum of the item prices."
@@ -1349,12 +1355,11 @@ class OrchestrationAgent(ToolCallingAgent):
         "request, forward requests to the relevant specialists, accept their responses, "
         "process thema and use them for further actions. "
         "Use the input from the specialists' responses for your reply to the customer."
-        "Delegate only the work that is relevant to the request.\n\n"
+        "Delegate only the work that is relevant to the request."
+        "Execute as many sales as possible! If a customer request can be fulfilled, COMPLETE THE SALE!\n\n"
         "Before calling the inventory manager, quote generator, or sales agent for a "
         "product, extract each product name and call tool_resolve_product_name. "
-        "Proceed only with a canonical_name when status is matched, and use that exact "
-        "canonical name in every specialist request."
-        "If the product name cannot be resolved to a canonical name, proceed with the most probable product name.\n"
+        "Proceed with the canonical name or (if unresolved) the most probable product name.\n"
         "Choose a specialist as follows:\n"
         "- Call the inventory manager for on-hand stock, item availability, supplier "
         "delivery estimates, and stock reorders. Every inventory manager request must "
@@ -1362,8 +1367,6 @@ class OrchestrationAgent(ToolCallingAgent):
         f"{INVENTORY_REQUEST_SCHEMA}\n"
         'Example: {"task": "Check on-hand stock", "item": "A4 paper", '
         '"quantity": 500, "date": "2025-04-01"}\n'
-        "Requests with missing, extra, or wrongly typed fields are rejected; correct "
-        "them and call again.\n"
         "The inventory manager replies with a JSON object that conforms to this JSON "
         "schema:\n"
         f"{INVENTORY_RESPONSE_SCHEMA}\n"
@@ -1376,20 +1379,18 @@ class OrchestrationAgent(ToolCallingAgent):
         "filling stock_on_hand and estimated_delivery_date per item from the "
         "inventory manager's responses:\n"
         f"{QUOTE_REQUEST_SCHEMA}\n"
-        "Requests with missing, extra, or wrongly typed fields are rejected; correct "
-        "them and call again. The quote generator replies with a JSON object that "
+        "The quote generator replies with a JSON object that "
         "conforms to this JSON schema:\n"
         f"{QUOTE_RESPONSE_SCHEMA}\n"
         "Check status first; take total_amount and is_estimate from the response "
         "instead of inferring them from result.\n"
-        "- Call the sales agent only when a customer clearly authorizes a purchase. "
+        "- Call the sales agent when a purchase is possible. "
         "Send a JSON object that conforms to this JSON schema, taking each item's "
         "total_price from the quote's line_items and quote_total from its "
         "total_amount. If the quote has no per-item prices, ask the quote generator "
         "for them first:\n"
         f"{SALES_REQUEST_SCHEMA}\n"
-        "Requests with missing, extra, or wrongly typed fields are rejected; correct "
-        "them and call again. The sales agent replies with a JSON object that conforms "
+        "The sales agent replies with a JSON object that conforms "
         "to this JSON schema:\n"
         f"{SALES_RESPONSE_SCHEMA}\n"
         "Check status first; treat a sale as recorded only for items with recorded=true.\n"
@@ -1397,8 +1398,7 @@ class OrchestrationAgent(ToolCallingAgent):
         "assets, or top-selling product reports. Send a JSON object that conforms to "
         "this JSON schema:\n"
         f"{REPORT_REQUEST_SCHEMA}\n"
-        "Requests with missing, extra, or wrongly typed fields are rejected; correct "
-        "them and call again. The reporting agent replies with a JSON object that "
+        "The reporting agent replies with a JSON object that "
         "conforms to this JSON schema:\n"
         f"{REPORT_RESPONSE_SCHEMA}\n"
         "Check status first; take cash_balance, inventory_value, and total_assets from "
@@ -1406,24 +1406,20 @@ class OrchestrationAgent(ToolCallingAgent):
         "When forwarding a task to a specialist, always formulate a clear request that includes all relevant details and context. "
         "For a customer quote or purchase request that names an item and quantity, "
         "check on-hand stock with the inventory manager before quoting availability or "
-        "asking the sales agent to record a sale. Reject a purchase request if the item is not in stock and the expected delivery date is higher than the customer-specified date. If the item is in stock, confirm the available quantity and any delivery estimate before quoting a price or recording a sale.\n\n"
-        "If delivery in time is realistic, call the inventory manager again with the "
-        "item, the full requested quantity, and the request date, and tell it to place a "
-        "stock order for the shortfall. It calculates the shortfall itself and dates the "
-        "order at the estimated delivery date. Do not pass a price; the inventory "
+        "asking the sales agent to record a sale. Use the request date supplied in the customer context as the posting date for both stock orders and sales. If stock is short, estimate arrival from the request date and compare that estimate with the customer's requested delivery deadline, if one was given. Do not proceed with the purchase if the estimate misses that deadline. Otherwise, place an order for the shortfall dated with the request date; after the order is confirmed, a sale may also be recorded with that same request date. If stock is already on hand, confirm the available quantity before quoting or recording a sale.\n\n"
+        "If the item is out of stock but delivery in time is realistic, call the inventory manager again and tell it to place a "
+        "stock order for the shortfall. It calculates the shortfall itself. Use the request date as the order's transaction date, not the estimated delivery date. Do not pass a price; the inventory "
         "manager determines the purchase price itself. Do not say the order was placed "
         "unless the inventory manager confirms successful execution.\n\n"
-        "Ordered stock becomes available only on its estimated delivery date. Use the "
-        "inventory manager's delivery estimate when explaining when it may become "
-        "available. Ask the sales agent to record a sale only when the goods are "
-        "available on the sale date: use the request date as date if the stock on hand "
-        "covers the quantity, or the estimated delivery date after a stock order was "
-        "placed. "
-        "Include the stock and delivery findings (also dates) in any follow-up call to "
+        "For this example, after the inventory manager confirms a reorder, treat the "
+        "ordered quantity as available for a sale posted on the request date, even if "
+        "the estimated arrival is later. Use the estimated delivery date only to check "
+        "the customer's deadline and explain expected arrival. Include the stock and "
+        "delivery findings (including dates) in any follow-up call to "
         "the quote generator.\n\n"
         "Historical quotes are examples, not guarantees of current prices, discounts, "
         "or availability. Do not invent prices, discounts, stock, or delivery promises. "
-        "Do not record a customer sale without clear authorization. Report actions as "
+        "Report actions as "
         "completed only after the responsible agent confirms them; otherwise explain "
         "what is pending or what information is needed."
     )
@@ -1510,7 +1506,8 @@ class InventoryManagerAgent(ToolCallingAgent):
         "## Input\n"
         "Each request is a JSON object that conforms to this JSON schema:\n"
         f"{INVENTORY_REQUEST_SCHEMA}\n"
-        "Use date as the as-of date.\n\n"
+        "Use date as the request date and stock-check cutoff. If placing a stock order, "
+        "also use this date as its transaction date.\n\n"
         "## Process\n"
         "1. Answer inventory questions with the inventory tools and the requested as-of "
         "date, and report stock quantities accurately.\n"
@@ -1523,9 +1520,9 @@ class InventoryManagerAgent(ToolCallingAgent):
         "the requester for a price. Ask for any other missing details instead of "
         "guessing.\n"
         "4. Record the order with tool_execute_order using "
-        'transaction_type="stock_orders" and the estimated delivery date as the '
-        "transaction date, so that the stock and the cash outflow take effect on "
-        "delivery.\n"
+        'transaction_type="stock_orders" and the request date as the transaction date. '
+        "Keep the estimated delivery date only as an arrival estimate; for this example, "
+        "the reorder is treated as available on its request-date posting.\n"
         "5. Report that the reorder was placed only after the tool confirms it.\n"
         "Do not use this process to record customer sales.\n\n"
         "## Output\n"
@@ -1536,8 +1533,8 @@ class InventoryManagerAgent(ToolCallingAgent):
         "Put any human-readable summary in the result field; never pass plain text to "
         "final_answer.\n"
         "- Set order_placed to true only after tool_execute_order succeeds, and then also "
-        "set transaction_id and total_price, with estimated_delivery_date equal to the "
-        "order's transaction date.\n"
+        "set transaction_id and total_price. Keep estimated_delivery_date as the "
+        "supplier's estimated arrival date, which may differ from the transaction date.\n"
         "- Use status needs_info if required details are missing.\n\n"
         "Example final_answer argument for a stock check without a shortfall:\n"
         '{"status": "ok", "result": "Stock on hand for A4 paper is 272 units.", '
@@ -1640,7 +1637,9 @@ class SalesAgent(ToolCallingAgent):
         "Every request is an authorized customer purchase.\n\n"
         "## Rules\n"
         "- Record an item only if the stock tool confirms the requested quantity is "
-        "available as of the date field. Skip the other items and give a reason.\n"
+        "available as of the request date in the date field. Use that same date for "
+        "the sale transaction, including when stock was reordered with that date. "
+        "Skip the other items and give a reason.\n"
         "- Record each item as its own transaction with transaction_type=\"sales\" "
         "and the given total_price unchanged.\n"
         "- Never invent or change prices, and do not promise a delivery date that has "
