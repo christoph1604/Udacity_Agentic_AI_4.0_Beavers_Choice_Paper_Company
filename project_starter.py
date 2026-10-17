@@ -1095,33 +1095,36 @@ def delegate(
     )
     return response_json
 
+class InventoryItemRequest(BaseModel):
+    """One requested item in an inventory manager request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item: str = Field(min_length=1, description="Exact item name.")
+    quantity: StrictInt = Field(gt=0, description="Number of units, as an integer.")
+
 class InventoryRequest(BaseModel):
     """Structured request sent from the orchestrator to the inventory manager."""
 
     model_config = ConfigDict(extra="forbid")
 
-    task: str = Field(
-        min_length=1,
-        description="What the inventory manager should do.",
+    task: str = Field(min_length=1, description="What the inventory manager should do.")
+    items: List[InventoryItemRequest] = Field(
+        min_length=1, description="Requested items with quantities."
     )
-    item: str = Field(min_length=1, description="Exact item name.")
-    quantity: StrictInt = Field(gt=0, description="Number of units, as an integer.")
     date: DateType = Field(
         description="Request date in YYYY-MM-DD format; use it as the stock-check cutoff and transaction posting date."
     )
 
 INVENTORY_REQUEST_SCHEMA = json.dumps(InventoryRequest.model_json_schema())
 
-class InventoryResponse(BaseModel):
-    """Structured response sent from the inventory manager back to the orchestrator."""
+class InventoryItemResponse(BaseModel):
+    """Inventory outcome for one requested item."""
 
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["ok", "needs_info", "rejected", "failed"] = Field(
-        description="Outcome of the request."
-    )
-    result: str = Field(description="Description of the work done.")
-    item: str = Field(default="", description="Item name from the request.")
+    item: str = Field(description="Item name from the request.")
+    quantity: StrictInt = Field(gt=0, description="Requested units.")
     stock_on_hand: Optional[StrictInt] = Field(
         default=None, description="Units on hand as of the request date, if checked."
     )
@@ -1140,6 +1143,19 @@ class InventoryResponse(BaseModel):
     )
     total_price: Optional[float] = Field(
         default=None, description="Total purchase price of the stock order, if placed."
+    )
+
+class InventoryResponse(BaseModel):
+    """Structured response sent from the inventory manager back to the orchestrator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "needs_info", "rejected", "failed"] = Field(
+        description="Outcome of the request."
+    )
+    result: str = Field(description="Description of the work done.")
+    items: List[InventoryItemResponse] = Field(
+        default_factory=list, description="One inventory result per requested item."
     )
 
 INVENTORY_RESPONSE_SCHEMA = json.dumps(InventoryResponse.model_json_schema())
@@ -1370,11 +1386,11 @@ class OrchestrationAgent(ToolCallingAgent):
         "The inventory manager replies with a JSON object that conforms to this JSON "
         "schema:\n"
         f"{INVENTORY_RESPONSE_SCHEMA}\n"
-        "Check status first; use stock_on_hand, shortfall, estimated_delivery_date, "
-        "order_placed, and total_price from the response instead of inferring them "
-        "from result.\n"
+        "Check status first; match each response entry in items by item name and use "
+        "its stock_on_hand, shortfall, estimated_delivery_date, order_placed, and "
+        "total_price instead of inferring them from result.\n"
         "- Call the quote generator when a customer asks for a quote or pricing "
-        "guidance. Call the inventory manager once per requested item first, then "
+        "guidance. Call the inventory manager once with all requested items first, then "
         "send the quote generator a JSON object that conforms to this JSON schema, "
         "filling stock_on_hand and estimated_delivery_date per item from the "
         "inventory manager's responses:\n"
@@ -1404,11 +1420,18 @@ class OrchestrationAgent(ToolCallingAgent):
         "Check status first; take cash_balance, inventory_value, and total_assets from "
         "the structured fields and any other details from result.\n\n"
         "When forwarding a task to a specialist, always formulate a clear request that includes all relevant details and context. "
-        "For a customer quote or purchase request that names an item and quantity, "
-        "check on-hand stock with the inventory manager before quoting availability or "
-        "asking the sales agent to record a sale. Use the request date supplied in the customer context as the posting date for both stock orders and sales. If stock is short, estimate arrival from the request date and compare that estimate with the customer's requested delivery deadline, if one was given. Do not proceed with the purchase if the estimate misses that deadline. Otherwise, place an order for the shortfall dated with the request date; after the order is confirmed, a sale may also be recorded with that same request date. If stock is already on hand, confirm the available quantity before quoting or recording a sale.\n\n"
-        "If the item is out of stock but delivery in time is realistic, call the inventory manager again and tell it to place a "
-        "stock order for the shortfall. It calculates the shortfall itself. Use the request date as the order's transaction date, not the estimated delivery date. Do not pass a price; the inventory "
+        "For a customer quote or purchase request that names one or more items and "
+        "quantities, call the inventory manager exactly once with all items in its "
+        "items array before quoting availability or asking the sales agent to record "
+        "a sale. Include in the task any delivery deadline and whether shortfall "
+        "reorders are authorized. The inventory manager checks stock, estimates any "
+        "shortfall delivery, and places authorized orders in that same run, but only "
+        "when the estimate meets the customer's deadline. Never call it again for "
+        "individual items or to place follow-up orders. Use the request date as the "
+        "posting date for stock orders and sales. If a shortfall's estimate misses "
+        "the deadline, do not proceed with the purchase. After an order is confirmed, "
+        "a sale may be recorded with the request date.\n\n"
+        "Do not pass a price; the inventory "
         "manager determines the purchase price itself. Do not say the order was placed "
         "unless the inventory manager confirms successful execution.\n\n"
         "For this example, after the inventory manager confirms a reorder, treat the "
@@ -1436,10 +1459,10 @@ class OrchestrationAgent(ToolCallingAgent):
             """Delegate inventory and supplier delivery questions to the inventory manager.
 
             Args:
-                request: Object with exactly the fields task (str), item (str), quantity (int), and date (YYYY-MM-DD).
+                request: Object with task (str), items (list of objects with item (str) and quantity (int)), and date (YYYY-MM-DD).
 
             Returns:
-                The inventory manager's response as a JSON string conforming to InventoryResponse.
+                The inventory manager's response as a JSON string conforming to InventoryResponse, with one result per item.
             """
             return delegate(self.inventory_manager_agent, request, InventoryRequest, InventoryResponse)
 
@@ -1509,13 +1532,16 @@ class InventoryManagerAgent(ToolCallingAgent):
         "Use date as the request date and stock-check cutoff. If placing a stock order, "
         "also use this date as its transaction date.\n\n"
         "## Process\n"
-        "1. Answer inventory questions with the inventory tools and the requested as-of "
-        "date, and report stock quantities accurately.\n"
-        "2. If the stock on hand is below the requested quantity, calculate the shortfall "
-        "and estimate the delivery date for the shortfall quantity, starting from the "
-        "request date.\n"
-        "3. Place a stock reorder only when explicitly asked to do so, and order only the "
-        "shortfall. Before ordering, look up the item's unit price with the unit price "
+        "1. Process every entry in items during this run, using its exact item name and "
+        "quantity. Check stock as of the requested date and return exactly one result "
+        "for each requested item. Do not repeat completed tool calls.\n"
+        "2. For each item whose stock is below its requested quantity, calculate the "
+        "shortfall once and estimate delivery for that shortfall from the request date. "
+        "For items with sufficient stock, do not calculate a shortfall or delivery date.\n"
+        "3. Place stock reorders only when the task explicitly authorizes them, and order "
+        "only each item's shortfall. If the task includes a delivery deadline, do not "
+        "place an order whose estimated arrival misses that deadline. Before ordering, "
+        "look up each item's unit price with the unit price "
         "tool and use unit price times shortfall as the total purchase price; never ask "
         "the requester for a price. Ask for any other missing details instead of "
         "guessing.\n"
@@ -1526,8 +1552,9 @@ class InventoryManagerAgent(ToolCallingAgent):
         "5. Report that the reorder was placed only after the tool confirms it.\n"
         "Do not use this process to record customer sales.\n\n"
         "## Output\n"
-        "Finish by calling final_answer with a JSON string that conforms to this JSON "
-        "schema, with item copied from the request:\n"
+        "Finish by calling final_answer with one JSON string that conforms to this JSON "
+        "schema. Return one entry in items for each request item, copying its item name "
+        "and quantity:\n"
         f"{INVENTORY_RESPONSE_SCHEMA}\n"
         f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION} "
         "Put any human-readable summary in the result field; never pass plain text to "
@@ -1537,10 +1564,10 @@ class InventoryManagerAgent(ToolCallingAgent):
         "supplier's estimated arrival date, which may differ from the transaction date.\n"
         "- Use status needs_info if required details are missing.\n\n"
         "Example final_answer argument for a stock check without a shortfall:\n"
-        '{"status": "ok", "result": "Stock on hand for A4 paper is 272 units.", '
-        '"item": "A4 paper", "stock_on_hand": 272, "shortfall": null, '
-        '"estimated_delivery_date": null, "order_placed": false, '
-        '"transaction_id": null, "total_price": null}'
+        '{"status": "ok", "result": "Stock check complete.", "items": '
+        '[{"item": "A4 paper", "quantity": 200, "stock_on_hand": 272, '
+        '"shortfall": 0, "estimated_delivery_date": null, "order_placed": false, '
+        '"transaction_id": null, "total_price": null}]}'
     )
 
     def __init__(self, model: OpenAIServerModel):
@@ -1573,20 +1600,18 @@ class QuoteGeneratorAgent(ToolCallingAgent):
     """
 
     PROMPT = (
-        "You are an expert for generating accurate customer quotes.\n\n"
+        "You are an expert for generating customer quotes using relevant historical quotes.\n\n"
         "## Input\n"
         "Each request is a JSON object that conforms to this JSON schema:\n"
         f"{QUOTE_REQUEST_SCHEMA}\n\n"
         "## Rules\n"
-        "- First decide whether the request and supplied context contain enough "
-        "information for a reliable quote.\n"
-        "- Use the quote history tool (search by item names and any job_type, "
-        "order_size, event_type) only when it helps to estimate or justify the quote.\n"
-        "- Historical quotes may be used to estimate or sanity-check a price, but only "
-        "as an estimate; they are never a binding current price. Without a current "
-        "price basis in the request or supplied context, the quote is at most an "
-        "estimate.\n"
-        "- Never invent prices, discounts or line items.\n\n"
+        "- Search quote history using the requested item names and any supplied "
+        "job_type, order_size, or event_type.\n"
+        "- Use the most relevant past quotes to estimate a clear total for this request. "
+        "Use past per-item prices when available; otherwise use a similar past quote "
+        "as the estimate and briefly explain the comparison.\n"
+        "- Treat every price based on history as an estimate. Do not invent prices or "
+        "discounts. If no useful quote is found, use status needs_info and say why.\n\n"
         "## Output\n"
         "Finish by calling final_answer with a JSON string that conforms to this JSON "
         "schema:\n"
@@ -1594,14 +1619,9 @@ class QuoteGeneratorAgent(ToolCallingAgent):
         f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION} "
         "Put any human-readable explanation in the result field; never pass plain text "
         "to final_answer.\n"
-        "- Binding quote: status ok, is_estimate false (only with a current price "
-        "basis).\n"
-        "- Estimate: status ok, is_estimate true; explain in result how the history was "
-        "used and what is assumed.\n"
-        "- Incomplete: status needs_info; explain in result what is missing, also if "
-        "per-item prices cannot be derived.\n"
-        "- Fill line_items only if per-item prices can be derived; line_total values "
-        "must then sum to total_amount.\n\n"
+        "- For a quote based on history, use status ok and is_estimate true. Include "
+        "the estimated total_amount and per-item line_items when the history supports "
+        "them; make line totals and the total agree.\n\n"
         "Example final_answer argument for an estimate based on quote history:\n"
         '{"status": "ok", "result": "Based on similar past ceremony quotes, the '
         'estimate is $20.00 for 200 sheets of A4 paper; no discount was supplied.", '
@@ -1741,7 +1761,8 @@ def run_test_scenarios():
         )
         quote_requests_sample.dropna(subset=["request_date"], inplace=True)
         #quote_requests_sample = quote_requests_sample.sort_values("request_date")
-        quote_requests_sample = quote_requests_sample.sort_values("request_date").head(1)
+        #quote_requests_sample = quote_requests_sample.sort_values("request_date").head(1)
+        quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[1]]
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
