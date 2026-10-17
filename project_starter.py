@@ -1081,23 +1081,8 @@ def delegate(
         )
         return response_json
 
-    try:
-        response_json = parse_model(response_cls, answer).model_dump_json()
-    except (json.JSONDecodeError, ValidationError, TypeError) as e:
-        response_json = response_cls(
-            status="failed",
-            result=f"{agent_name} returned an invalid structured response: {type(e).__name__}: {e}",
-        ).model_dump_json()
-        _record_handoff(
-            "orchestrator",
-            agent_name,
-            agent_request,
-            response_json,
-            "invalid_response",
-            started_at,
-            started_clock,
-        )
-        return response_json
+    # Every agent uses make_final_answer_check, so the answer is already validated here.
+    response_json = parse_model(response_cls, answer).model_dump_json()
 
     _record_handoff(
         "orchestrator",
@@ -1521,31 +1506,44 @@ class InventoryManagerAgent(ToolCallingAgent):
     """
 
     PROMPT = (
+        "You are an inventory manager.\n\n"
+        "## Input\n"
         "Each request is a JSON object that conforms to this JSON schema:\n"
         f"{INVENTORY_REQUEST_SCHEMA}\n"
-        "Use date as the as-of date. "
-        "Answer inventory questions using the inventory tools and the requested as-of "
-        "date, and report stock quantities accurately. If the stock on hand is below "
-        "the requested quantity, calculate the shortfall with the shortfall tool and "
-        "estimate the delivery date for the shortfall quantity, not the requested "
-        "quantity, with the delivery timeline tool, starting from the request date. "
-        "Place a stock reorder only when explicitly asked to do so, and order only the "
+        "Use date as the as-of date.\n\n"
+        "## Process\n"
+        "1. Answer inventory questions with the inventory tools and the requested as-of "
+        "date, and report stock quantities accurately.\n"
+        "2. If the stock on hand is below the requested quantity, calculate the shortfall "
+        "and estimate the delivery date for the shortfall quantity, starting from the "
+        "request date.\n"
+        "3. Place a stock reorder only when explicitly asked to do so, and order only the "
         "shortfall. Before ordering, look up the item's unit price with the unit price "
-        "tool and use unit price times shortfall as the total purchase price; never "
-        "ask the requester for a price. Ask for any other missing details instead of "
-        "guessing. Record the order with tool_execute_order using "
+        "tool and use unit price times shortfall as the total purchase price; never ask "
+        "the requester for a price. Ask for any other missing details instead of "
+        "guessing.\n"
+        "4. Record the order with tool_execute_order using "
         'transaction_type="stock_orders" and the estimated delivery date as the '
-        "transaction date, not the request date, so that the stock and the cash "
-        "outflow take effect on delivery. Report that the reorder was placed only "
-        "after the tool confirms it. Do not use this process to record customer sales.\n"
-        "Return your final answer as a JSON object that conforms to this JSON schema, "
-        "with item copied from the request:\n"
+        "transaction date, so that the stock and the cash outflow take effect on "
+        "delivery.\n"
+        "5. Report that the reorder was placed only after the tool confirms it.\n"
+        "Do not use this process to record customer sales.\n\n"
+        "## Output\n"
+        "Finish by calling final_answer with a JSON string that conforms to this JSON "
+        "schema, with item copied from the request:\n"
         f"{INVENTORY_RESPONSE_SCHEMA}\n"
-        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION}\n"
-        "Set order_placed to true only after tool_execute_order succeeds, and then also "
+        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION} "
+        "Put any human-readable summary in the result field; never pass plain text to "
+        "final_answer.\n"
+        "- Set order_placed to true only after tool_execute_order succeeds, and then also "
         "set transaction_id and total_price, with estimated_delivery_date equal to the "
-        "order's transaction date. Use status needs_info if required details "
-        "are missing."
+        "order's transaction date.\n"
+        "- Use status needs_info if required details are missing.\n\n"
+        "Example final_answer argument for a stock check without a shortfall:\n"
+        '{"status": "ok", "result": "Stock on hand for A4 paper is 272 units.", '
+        '"item": "A4 paper", "stock_on_hand": 272, "shortfall": null, '
+        '"estimated_delivery_date": null, "order_placed": false, '
+        '"transaction_id": null, "total_price": null}'
     )
 
     def __init__(self, model: OpenAIServerModel):
@@ -1578,22 +1576,40 @@ class QuoteGeneratorAgent(ToolCallingAgent):
     """
 
     PROMPT = (
+        "You are an expert for generating accurate customer quotes.\n\n"
+        "## Input\n"
         "Each request is a JSON object that conforms to this JSON schema:\n"
-        f"{QUOTE_REQUEST_SCHEMA}\n"
-        "Use the quote history tool to find relevant examples, using the item names "
-        "and any job_type, order_size, and event_type as search terms, then explain how they "
-        "relate to the customer's request. Treat historical quotes as context, not as "
-        "current prices. Apply only discount rules and prices provided in the request "
-        "or other supplied context; do not invent prices or discounts. Ask for missing "
-        "details needed to prepare a reliable quote, and make clear when a quote is "
-        "only an estimate.\n"
-        "Return your final answer as a JSON object that conforms to this JSON schema:\n"
+        f"{QUOTE_REQUEST_SCHEMA}\n\n"
+        "## Rules\n"
+        "- First decide whether the request and supplied context contain enough "
+        "information for a reliable quote.\n"
+        "- Use the quote history tool (search by item names and any job_type, "
+        "order_size, event_type) only when it helps to estimate or justify the quote.\n"
+        "- Historical quotes may be used to estimate or sanity-check a price, but only "
+        "as an estimate; they are never a binding current price. Without a current "
+        "price basis in the request or supplied context, the quote is at most an "
+        "estimate.\n"
+        "- Never invent prices, discounts or line items.\n\n"
+        "## Output\n"
+        "Finish by calling final_answer with a JSON string that conforms to this JSON "
+        "schema:\n"
         f"{QUOTE_RESPONSE_SCHEMA}\n"
-        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION}\n"
-        "Set total_amount only from the history and supplied context, and fill "
-        "line_items only if per-item prices can be derived from them. Use status "
-        "needs_info if details are missing or if the task asks for per-item prices "
-        "that cannot be derived."
+        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION} "
+        "Put any human-readable explanation in the result field; never pass plain text "
+        "to final_answer.\n"
+        "- Binding quote: status ok, is_estimate false (only with a current price "
+        "basis).\n"
+        "- Estimate: status ok, is_estimate true; explain in result how the history was "
+        "used and what is assumed.\n"
+        "- Incomplete: status needs_info; explain in result what is missing, also if "
+        "per-item prices cannot be derived.\n"
+        "- Fill line_items only if per-item prices can be derived; line_total values "
+        "must then sum to total_amount.\n\n"
+        "Example final_answer argument for an estimate based on quote history:\n"
+        '{"status": "ok", "result": "Based on similar past ceremony quotes, the '
+        'estimate is $20.00 for 200 sheets of A4 paper; no discount was supplied.", '
+        '"is_estimate": true, "total_amount": 20.0, "line_items": [{"item": "A4 paper", '
+        '"quantity": 200, "unit_price": 0.1, "line_total": 20.0}]}'
     )
 
     def __init__(self, model: OpenAIServerModel):
@@ -1617,21 +1633,37 @@ class SalesAgent(ToolCallingAgent):
     """
 
     PROMPT = (
+        "You are a sales agent who records authorized customer purchases.\n\n"
+        "## Input\n"
         "Each request is a JSON object that conforms to this JSON schema:\n"
         f"{SALES_REQUEST_SCHEMA}\n"
-        "Every request is an authorized customer purchase. "
-        "For each item, use the stock tool to verify the requested quantity is "
-        "available as of the date field. Record only the items that are in stock, "
-        "each with its own transaction, using the given total_price unchanged, and skip "
-        'the others with a reason. Use transaction_type="sales" for customer purchases. '
-        "Do not invent or change prices, and do not promise a delivery date that has "
+        "Every request is an authorized customer purchase.\n\n"
+        "## Rules\n"
+        "- Record an item only if the stock tool confirms the requested quantity is "
+        "available as of the date field. Skip the other items and give a reason.\n"
+        "- Record each item as its own transaction with transaction_type=\"sales\" "
+        "and the given total_price unchanged.\n"
+        "- Never invent or change prices, and do not promise a delivery date that has "
         "not been confirmed.\n"
-        "Return your final answer as a JSON object that conforms to this JSON schema:\n"
+        "- Report an item as recorded only after tool_execute_order succeeds.\n\n"
+        "## Output\n"
+        "Finish by calling final_answer with a JSON string that conforms to this JSON "
+        "schema:\n"
         f"{SALES_RESPONSE_SCHEMA}\n"
-        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION}\n"
-        "Set recorded to true only after tool_execute_order succeeds, and then also set "
-        "transaction_id and total_price. Use status partial if only some items were "
-        "recorded."
+        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION} "
+        "Put any human-readable summary in the result field; never pass plain text to "
+        "final_answer.\n"
+        "- Add one entry in items per requested item. A recorded item needs "
+        "transaction_id and total_price; a skipped item needs a reason.\n"
+        "- Status ok: all items recorded; partial: only some recorded. "
+        "total_recorded is the sum of the recorded prices.\n\n"
+        "Example final_answer argument when one of two items was out of stock:\n"
+        '{"status": "partial", "result": "Recorded A4 paper; poster paper is out of '
+        'stock.", "items": [{"item": "A4 paper", "quantity": 200, "recorded": true, '
+        '"transaction_id": 42, "total_price": 20.0, "reason": null}, '
+        '{"item": "Poster paper", "quantity": 50, "recorded": false, '
+        '"transaction_id": null, "total_price": null, "reason": "Insufficient stock"}], '
+        '"total_recorded": 20.0}'
     )
 
     def __init__(self, model: OpenAIServerModel):
@@ -1656,19 +1688,33 @@ class ReportingAgent(ToolCallingAgent):
     """
 
     PROMPT = (
+        "You are a reporting agent who prepares dated financial reports.\n\n"
+        "## Input\n"
         "Each request is a JSON object that conforms to this JSON schema:\n"
         f"{REPORT_REQUEST_SCHEMA}\n"
-        "Generate reports using the financial report tool and the requested date as "
-        "the as-of date. "
-        "Summarize cash balance, inventory value, and total assets; include itemized "
-        "inventory or top-selling products when relevant. Clearly label the report date "
-        "and distinguish reported figures from any interpretation. Do not infer values "
-        "the report does not provide.\n"
-        "Return your final answer as a JSON object that conforms to this JSON schema:\n"
+        "Use date as the as-of date.\n\n"
+        "## Rules\n"
+        "- Base every figure on the financial report and cash balance tools; do not "
+        "infer or invent values the tools do not provide.\n"
+        "- Summarize cash balance, inventory value and total assets, and include "
+        "itemized inventory or top-selling products when relevant to the request.\n"
+        "- Clearly label the report date and keep reported figures separate from any "
+        "interpretation.\n\n"
+        "## Output\n"
+        "Finish by calling final_answer with a JSON string that conforms to this JSON "
+        "schema:\n"
         f"{REPORT_RESPONSE_SCHEMA}\n"
-        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION}\n"
-        "Fill cash_balance, inventory_value, and total_assets only from the tools, and "
-        "put itemized inventory and top-selling products in result."
+        f"{STRICT_JSON_FINAL_ANSWER_INSTRUCTION} "
+        "Put the report text, including itemized inventory and top-selling products, in "
+        "the result field; never pass plain text to final_answer.\n"
+        "- Set as_of_date for every status ok report.\n"
+        "- Fill cash_balance, inventory_value and total_assets only from the tools; "
+        "total_assets must equal cash_balance plus inventory_value.\n\n"
+        "Example final_answer argument for a summary report:\n"
+        '{"status": "ok", "result": "Report as of 2025-04-01: cash balance $45,000.00, '
+        'inventory value $5,000.00, total assets $50,000.00.", '
+        '"as_of_date": "2025-04-01", "cash_balance": 45000.0, '
+        '"inventory_value": 5000.0, "total_assets": 50000.0}'
     )
 
     def __init__(self, model: OpenAIServerModel):
@@ -1695,8 +1741,8 @@ def run_test_scenarios():
             quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
         )
         quote_requests_sample.dropna(subset=["request_date"], inplace=True)
-        quote_requests_sample = quote_requests_sample.sort_values("request_date")
-        #quote_requests_sample = quote_requests_sample.sort_values("request_date").head(1)
+        #quote_requests_sample = quote_requests_sample.sort_values("request_date")
+        quote_requests_sample = quote_requests_sample.sort_values("request_date").head(1)
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
