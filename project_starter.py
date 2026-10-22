@@ -138,17 +138,36 @@ paper_supplies = [
 
 
 def _normalize_product_text(value: str) -> str:
+    """Lowercase, drop punctuation and singularize each word ("Paper Cups!" -> "paper cup")."""
     normalized = unicodedata.normalize("NFKC", value).casefold()
-    return " ".join(re.sub(r"[^\w]+", " ", normalized).split())
+    words = re.sub(r"[^\w]+", " ", normalized).split()
+    return " ".join(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words)
 
 
+# Closed-world synonyms: every target must be a catalog item name.
 PRODUCT_NAME_ALIASES = {
     "a4 sheet": "A4 paper",
-    "a4 sheets": "A4 paper",
-    "colored sheets": "Colored paper",
-    "colour paper": "Colored paper",
+    "a4 copy paper": "A4 paper",
+    "printer paper": "Standard copy paper",
+    "printing paper": "Standard copy paper",
     "copy paper": "Standard copy paper",
-    "glossy sheets": "Glossy paper",
+    "white paper": "Standard copy paper",
+    "colour paper": "Colored paper",
+    "color paper": "Colored paper",
+    "colored sheet": "Colored paper",
+    "colour sheet": "Colored paper",
+    "glossy sheet": "Glossy paper",
+    "gloss paper": "Glossy paper",
+    "recycled sheet": "Recycled paper",
+    "card stock": "Cardstock",
+    "napkin": "Paper napkins",
+    "plate": "Paper plates",
+    "envelope": "Envelopes",
+    "streamer": "Party streamers",
+    "washi tape": "Decorative adhesive tape (washi tape)",
+    "banner": "Banner paper",
+    "poster": "Poster paper",
+    "folder": "Presentation folders",
 }
 _CANONICAL_PRODUCTS = {
     _normalize_product_text(item["item_name"]): item["item_name"]
@@ -159,52 +178,65 @@ _NORMALIZED_PRODUCT_ALIASES = {
     for alias, canonical_name in PRODUCT_NAME_ALIASES.items()
 }
 
-
-_GENERIC_WORDS = {"paper", "sheet", "sheets", "of", "and", "the", "with"}
+_GENERIC_WORDS = {"paper", "sheet", "of", "and", "the", "with", "a"}
+FUZZY_CUTOFF = 0.85  # Typo tolerance only.
+_SIZE_PRODUCTS = {"A4 paper", "Letter-sized paper", "Legal-size paper"}
 
 
 def _product_tokens(normalized_name: str) -> set:
-    return {t.rstrip("s") for t in normalized_name.split() if t not in _GENERIC_WORDS}
+    return {t for t in normalized_name.split() if t not in _GENERIC_WORDS}
 
 
 def _resolve_product_name(product_name: str) -> Dict[str, Any]:
+    """Map text to one catalog item: exact, alias, typo, then unique word match; else ambiguous/unknown."""
     normalized_name = _normalize_product_text(product_name)
-    canonical_name = _CANONICAL_PRODUCTS.get(normalized_name)
-    match_type = "canonical"
 
-    if canonical_name is None:
-        canonical_name = _NORMALIZED_PRODUCT_ALIASES.get(normalized_name)
-        match_type = "alias"
-
-    if canonical_name is not None:
+    def result(status: str, canonical: Optional[str] = None, match_type: Optional[str] = None, candidates=()):
         return {
-            "status": "matched",
+            "status": status,
             "requested_name": product_name,
-            "canonical_name": canonical_name,
+            "normalized_name": normalized_name,
+            "canonical_name": canonical,
             "match_type": match_type,
-            "candidates": [],
+            "candidates": list(candidates),
         }
 
-    similar_names = get_close_matches(
-        normalized_name,
-        list(_CANONICAL_PRODUCTS),
-        n=3,
-        cutoff=0.75,
-    )
-    # A candidate must also share a meaningful word, so unrelated products stay unknown.
-    requested_tokens = _product_tokens(normalized_name)
-    candidates = [
-        _CANONICAL_PRODUCTS[name]
-        for name in similar_names
-        if requested_tokens & _product_tokens(name)
-    ]
-    return {
-        "status": "needs_clarification" if candidates else "unknown",
-        "requested_name": product_name,
-        "canonical_name": None,
-        "match_type": None,
-        "candidates": candidates,
+    if normalized_name in _CANONICAL_PRODUCTS:
+        return result("matched", _CANONICAL_PRODUCTS[normalized_name], "canonical")
+    if normalized_name in _NORMALIZED_PRODUCT_ALIASES:
+        return result("matched", _NORMALIZED_PRODUCT_ALIASES[normalized_name], "alias")
+
+    # Catalog name contained in the request, e.g. "heavy cardstock (white)" -> Cardstock.
+    request_words = set(normalized_name.split())
+    contained = {
+        name: len(key.split()) for key, name in _CANONICAL_PRODUCTS.items()
+        if set(key.split()) <= request_words
     }
+    best = max(contained.values(), default=0)
+    candidates = [name for name, size in contained.items() if size == best]
+    # A size word like "A4" only describes the other product ("A4 glossy paper").
+    specific = [name for name in candidates if name not in _SIZE_PRODUCTS]
+    candidates = specific or candidates
+
+    if not candidates:
+        candidates = [
+            _CANONICAL_PRODUCTS[n]
+            for n in get_close_matches(normalized_name, list(_CANONICAL_PRODUCTS), n=3, cutoff=FUZZY_CUTOFF)
+        ]
+    if not candidates:
+        # Request is a part of a catalog name, e.g. "cups".
+        requested_tokens = _product_tokens(normalized_name)
+        if requested_tokens:
+            candidates = [
+                name for key, name in _CANONICAL_PRODUCTS.items()
+                if requested_tokens <= _product_tokens(key)
+            ]
+
+    if len(candidates) == 1:
+        return result("matched", candidates[0], "partial")
+    if candidates:
+        return result("ambiguous", candidates=candidates)
+    return result("unknown")
 
 
 def _normalize_request_products(request_model: BaseModel) -> Tuple[BaseModel, Optional[str], str]:
@@ -1409,7 +1441,7 @@ class OrchestrationAgent(ToolCallingAgent):
         "product, extract each product name and call tool_resolve_product_name. "
         "Proceed only with a resolved canonical name. If the status is unknown, do not "
         "delegate; reject the whole request with a brief apology. If it is "
-        "needs_clarification, ask the customer which of the candidates they mean.\n"
+        "ambiguous, ask the customer which of the candidates they mean.\n"
         "Choose a specialist as follows:\n"
         "- Call the inventory manager for on-hand stock, item availability, supplier "
         "delivery estimates, and stock reorders. Every inventory manager request must "
@@ -1812,7 +1844,8 @@ def run_test_scenarios():
         )
         quote_requests_sample.dropna(subset=["request_date"], inplace=True)
         #quote_requests_sample = quote_requests_sample.sort_values("request_date")
-        quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[0]]
+        quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[:11]
+        #quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[2]]
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
@@ -1906,6 +1939,7 @@ def run_test_scenarios():
                 "response": response,
             }
         )
+        pd.DataFrame(results).to_csv("test_results.csv", index=False)
 
         time.sleep(1)
 
@@ -1916,8 +1950,6 @@ def run_test_scenarios():
     print(f"Final Cash: ${final_report['cash_balance']:.2f}")
     print(f"Final Inventory: ${final_report['inventory_value']:.2f}")
 
-    # Save results
-    pd.DataFrame(results).to_csv("test_results.csv", index=False)
     return results
 
 
