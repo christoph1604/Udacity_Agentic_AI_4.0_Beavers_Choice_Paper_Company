@@ -6,6 +6,7 @@ import dotenv
 import ast
 import json
 import contextvars
+import copy
 import logging
 import re
 import unicodedata
@@ -19,6 +20,8 @@ from smolagents import ToolCallingAgent, OpenAIServerModel, load_dotenv, tool
 from uuid import uuid4
 
 HANDOFF_TRACE_FILE = "handoff_trace.jsonl"
+MAX_SUBAGENT_CALLS_PER_RUN = 10  # Orchestrator delegations per orchestrator run.
+MAX_TOOL_CALLS_PER_AGENT_RUN = 20  # Tool calls per agent run (orchestrator and each subagent run).
 _HANDOFF_RUN_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "handoff_run_id", default=None
 )
@@ -1080,16 +1083,75 @@ def make_final_answer_check(model_cls: Type[BaseModel]) -> Callable[..., bool]:
         return True
     return check_final_answer
 
+def apply_run_limits(agent: ToolCallingAgent) -> None:
+    """Cap tool calls per run and reset the per-run counters whenever the agent runs.
+
+    Tools are copied first because some tool objects are shared between agents.
+    Once the cap is reached, tools return a message instead of executing (soft limit).
+    """
+    agent._tool_call_count = 0
+    agent._subagent_call_count = 0
+
+    def budgeted(tool_obj):
+        tool_copy = copy.copy(tool_obj)
+        original_forward = tool_copy.forward
+
+        def forward(*args, **kwargs):
+            agent._tool_call_count += 1
+            if agent._tool_call_count > MAX_TOOL_CALLS_PER_AGENT_RUN:
+                return (
+                    f"Tool call limit ({MAX_TOOL_CALLS_PER_AGENT_RUN}) reached for this run; "
+                    "no further tools are available. Provide your final answer now."
+                )
+            return original_forward(*args, **kwargs)
+
+        tool_copy.forward = forward
+        return tool_copy
+
+    for name in list(agent.tools):
+        if name != "final_answer":
+            agent.tools[name] = budgeted(agent.tools[name])
+
+    original_run = agent.run
+
+    def run(*args, **kwargs):
+        agent._tool_call_count = 0
+        agent._subagent_call_count = 0
+        return original_run(*args, **kwargs)
+
+    agent.run = run
+
 def delegate(
     agent: ToolCallingAgent,
     request: Any,
     request_cls: Type[BaseModel],
     response_cls: Type[BaseModel],
+    caller: Optional[ToolCallingAgent] = None,
 ) -> str:
     """Validate the request, run the agent, and return its validated response as JSON."""
     started_at = datetime.now(timezone.utc)
     started_clock = time.perf_counter()
     agent_name = getattr(agent, "name", type(agent).__name__)
+    if caller is not None:
+        caller._subagent_call_count += 1
+        if caller._subagent_call_count > MAX_SUBAGENT_CALLS_PER_RUN:
+            response_json = response_cls(
+                status="rejected",
+                result=(
+                    f"Subagent call limit ({MAX_SUBAGENT_CALLS_PER_RUN}) reached for this run; "
+                    "do not delegate again. Finalize your answer with the information gathered."
+                ),
+            ).model_dump_json()
+            _record_handoff(
+                "orchestrator",
+                agent_name,
+                request,
+                response_json,
+                "limit_reached",
+                started_at,
+                started_clock,
+            )
+            return response_json
     try:
         validated = request_cls.model_validate(request)
     except ValidationError as e:
@@ -1538,7 +1600,7 @@ class OrchestrationAgent(ToolCallingAgent):
             Returns:
                 The inventory manager's response as a JSON string conforming to InventoryResponse, with one result per item.
             """
-            return delegate(self.inventory_manager_agent, request, InventoryRequest, InventoryResponse)
+            return delegate(self.inventory_manager_agent, request, InventoryRequest, InventoryResponse, caller=self)
 
         @tool
         def call_quote_generator(request: dict) -> str:
@@ -1550,7 +1612,7 @@ class OrchestrationAgent(ToolCallingAgent):
             Returns:
                 The quote generator's response as a JSON string conforming to QuoteResponse.
             """
-            return delegate(self.quote_generator_agent, request, QuoteRequest, QuoteResponse)
+            return delegate(self.quote_generator_agent, request, QuoteRequest, QuoteResponse, caller=self)
 
         @tool
         def call_sales_agent(request: dict) -> str:
@@ -1562,7 +1624,7 @@ class OrchestrationAgent(ToolCallingAgent):
             Returns:
                 The sales agent's response as a JSON string conforming to SalesResponse.
             """
-            return delegate(self.sales_agent, request, SalesRequest, SalesResponse)
+            return delegate(self.sales_agent, request, SalesRequest, SalesResponse, caller=self)
 
         @tool
         def call_reporting_agent(request: dict) -> str:
@@ -1574,7 +1636,7 @@ class OrchestrationAgent(ToolCallingAgent):
             Returns:
                 The reporting agent's response as a JSON string conforming to ReportResponse.
             """
-            return delegate(self.reporting_agent, request, ReportRequest, ReportResponse)
+            return delegate(self.reporting_agent, request, ReportRequest, ReportResponse, caller=self)
 
         super().__init__(
             model=model,
@@ -1588,6 +1650,7 @@ class OrchestrationAgent(ToolCallingAgent):
             ],
             instructions=self.PROMPT,
         )
+        apply_run_limits(self)
 
 class InventoryManagerAgent(ToolCallingAgent):
     """
@@ -1664,6 +1727,7 @@ class InventoryManagerAgent(ToolCallingAgent):
             name="inventory_manager_agent_01",
             description="Checks inventory, estimates delivery timelines, and places authorized stock reorders.",
         )
+        apply_run_limits(self)
 
 class QuoteGeneratorAgent(ToolCallingAgent):
     """
@@ -1719,6 +1783,7 @@ class QuoteGeneratorAgent(ToolCallingAgent):
             name="quote_generator_agent_01",
             description="Generates customer quotes using request details and relevant historical quotes.",
         )
+        apply_run_limits(self)
 
 class SalesAgent(ToolCallingAgent):
     """
@@ -1777,6 +1842,7 @@ class SalesAgent(ToolCallingAgent):
             name="sales_agent_01",
             description="Processes customer orders, records sales, and checks stock availability.",
         )
+        apply_run_limits(self)
 
 class ReportingAgent(ToolCallingAgent):
     """
@@ -1829,6 +1895,7 @@ class ReportingAgent(ToolCallingAgent):
             name="reporting_agent_01",
             description="Generates financial reports on cash, inventory, and company assets.",
         )
+        apply_run_limits(self)
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
