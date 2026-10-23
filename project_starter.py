@@ -141,13 +141,16 @@ paper_supplies = [
 
 
 def _normalize_product_text(value: str) -> str:
-    """Lowercase, drop punctuation and singularize each word ("Paper Cups!" -> "paper cup")."""
+    """Lowercase, drop punctuation, singularize each word and join sizes ("Paper Cups!" -> "paper cup")."""
     normalized = unicodedata.normalize("NFKC", value).casefold()
     words = re.sub(r"[^\w]+", " ", normalized).split()
-    return " ".join(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words)
+    text = " ".join(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words)
+    return re.sub(r"(\d) ?[x×] ?(\d)", r"\1x\2", text)  # "24 x 36" -> "24x36"
 
 
-# Closed-world synonyms: every target must be a catalog item name.
+# Closed-world mapping for special cases: every target must be a catalog item name.
+# A key also applies when it appears as a whole phrase inside a longer request
+# ("white printer paper" -> "printer paper") and no unique catalog name was found; longer keys win.
 PRODUCT_NAME_ALIASES = {
     "a4 sheet": "A4 paper",
     "a4 copy paper": "A4 paper",
@@ -171,6 +174,8 @@ PRODUCT_NAME_ALIASES = {
     "banner": "Banner paper",
     "poster": "Poster paper",
     "folder": "Presentation folders",
+    "poster board 24x36": "Large poster paper (24x36 inches)",
+    "poster board": "Poster paper",
 }
 _CANONICAL_PRODUCTS = {
     _normalize_product_text(item["item_name"]): item["item_name"]
@@ -180,10 +185,12 @@ _NORMALIZED_PRODUCT_ALIASES = {
     _normalize_product_text(alias): canonical_name
     for alias, canonical_name in PRODUCT_NAME_ALIASES.items()
 }
+_ALIAS_KEYS_LONGEST_FIRST = sorted(_NORMALIZED_PRODUCT_ALIASES, key=lambda key: -len(key.split()))
 
 _GENERIC_WORDS = {"paper", "sheet", "of", "and", "the", "with", "a"}
 FUZZY_CUTOFF = 0.85  # Typo tolerance only.
 _SIZE_PRODUCTS = {"A4 paper", "Letter-sized paper", "Legal-size paper"}
+_LIST_SEPARATOR = re.compile(r"\s+(?:and|&)\s+|[,;/]", re.IGNORECASE)
 
 
 def _product_tokens(normalized_name: str) -> set:
@@ -191,23 +198,34 @@ def _product_tokens(normalized_name: str) -> set:
 
 
 def _resolve_product_name(product_name: str) -> Dict[str, Any]:
-    """Map text to one catalog item: exact, alias, typo, then unique word match; else ambiguous/unknown."""
+    """Map text to one catalog item; otherwise ambiguous (several candidates) or unknown (none).
+
+    Order: exact name or mapping, several products in one text, catalog name inside the text,
+    mapping phrase inside the text, typo, part of a catalog name.
+    """
     normalized_name = _normalize_product_text(product_name)
 
-    def result(status: str, canonical: Optional[str] = None, match_type: Optional[str] = None, candidates=()):
+    def result(status: str, resolved: Optional[str] = None, candidates=()):
         return {
             "status": status,
             "requested_name": product_name,
-            "normalized_name": normalized_name,
-            "canonical_name": canonical,
-            "match_type": match_type,
+            "resolved_name": resolved,
             "candidates": list(candidates),
         }
 
     if normalized_name in _CANONICAL_PRODUCTS:
-        return result("matched", _CANONICAL_PRODUCTS[normalized_name], "canonical")
+        return result("matched", _CANONICAL_PRODUCTS[normalized_name])
     if normalized_name in _NORMALIZED_PRODUCT_ALIASES:
-        return result("matched", _NORMALIZED_PRODUCT_ALIASES[normalized_name], "alias")
+        return result("matched", _NORMALIZED_PRODUCT_ALIASES[normalized_name])
+
+    # "cardstock and colored paper" names two products, so the customer has to choose.
+    parts = [part for part in _LIST_SEPARATOR.split(product_name) if part.strip()]
+    if len(parts) > 1:
+        found = {
+            r["resolved_name"] for r in map(_resolve_product_name, parts) if r["status"] == "matched"
+        }
+        if len(found) > 1:
+            return result("ambiguous", candidates=sorted(found))
 
     # Catalog name contained in the request, e.g. "heavy cardstock (white)" -> Cardstock.
     request_words = set(normalized_name.split())
@@ -221,7 +239,16 @@ def _resolve_product_name(product_name: str) -> Dict[str, Any]:
     specific = [name for name in candidates if name not in _SIZE_PRODUCTS]
     candidates = specific or candidates
 
-    if not candidates:
+    # No unique catalog name: try a mapping phrase inside the request, e.g.
+    # "white printer paper" -> Standard copy paper, "kraft paper envelopes" -> Envelopes.
+    if len(candidates) != 1:
+        padded_name = f" {normalized_name} "
+        for key in _ALIAS_KEYS_LONGEST_FIRST:
+            if f" {key} " in padded_name:
+                return result("matched", _NORMALIZED_PRODUCT_ALIASES[key])
+
+    # Typos only: texts with numbers are never fuzzy-matched ("A3 paper" is not "A4 paper").
+    if not candidates and not re.search(r"\d", normalized_name):
         candidates = [
             _CANONICAL_PRODUCTS[n]
             for n in get_close_matches(normalized_name, list(_CANONICAL_PRODUCTS), n=3, cutoff=FUZZY_CUTOFF)
@@ -236,7 +263,7 @@ def _resolve_product_name(product_name: str) -> Dict[str, Any]:
             ]
 
     if len(candidates) == 1:
-        return result("matched", candidates[0], "partial")
+        return result("matched", candidates[0])
     if candidates:
         return result("ambiguous", candidates=candidates)
     return result("unknown")
@@ -267,7 +294,7 @@ def _normalize_request_products(request_model: BaseModel) -> Tuple[BaseModel, Op
                 f"Possible matches: {', '.join(candidates)}. "
                 "Ask the customer to clarify the product name before checking stock, quoting, or recording a sale."
             ), "needs_info"
-        canonical_names.append(resolution["canonical_name"])
+        canonical_names.append(resolution["resolved_name"])
 
     if field_name == "item":
         return request_model.model_copy(update={"item": canonical_names[0]}), None, ""
@@ -832,7 +859,12 @@ def tool_resolve_product_name(product_name: str) -> str:
         product_name: One extracted product name, without quantity or request text.
 
     Returns:
-        JSON with status, canonical_name, match_type, and clarification candidates.
+        JSON with these fields:
+        - status: "matched" (one catalog item found), "ambiguous" (several
+          possible items) or "unknown" (no catalog item found).
+        - requested_name: the input, unchanged.
+        - resolved_name: exact catalog name when status is "matched", else null.
+        - candidates: possible catalog names when status is "ambiguous", else [].
     """
     return json.dumps(_resolve_product_name(product_name), ensure_ascii=False)
 
@@ -1501,7 +1533,8 @@ class OrchestrationAgent(ToolCallingAgent):
         "request with a brief apology and do not quote or sell any part of it.\n\n"
         "Before calling the inventory manager, quote generator, or sales agent for a "
         "product, extract each product name and call tool_resolve_product_name. "
-        "Proceed only with a resolved canonical name. If the status is unknown, do not "
+        "Proceed only with the resolved_name of a matched result, using it exactly as the "
+        "product name in all further requests. If the status is unknown, do not "
         "delegate; reject the whole request with a brief apology. If it is "
         "ambiguous, ask the customer which of the candidates they mean.\n"
         "Choose a specialist as follows:\n"
@@ -1910,8 +1943,8 @@ def run_test_scenarios():
             quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
         )
         quote_requests_sample.dropna(subset=["request_date"], inplace=True)
-        #quote_requests_sample = quote_requests_sample.sort_values("request_date")
-        quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[:11]
+        quote_requests_sample = quote_requests_sample.sort_values("request_date")
+        #quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[:10]
         #quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[2]]
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
