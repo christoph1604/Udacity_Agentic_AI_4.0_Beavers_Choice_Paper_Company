@@ -1,27 +1,37 @@
 ---
 config:
   layout: dagre
+  theme: base
+  themeVariables:
+    background: "#ffffff"
+    primaryTextColor: "#111827"
+    lineColor: "#475569"
+    textColor: "#111827"
 ---
-flowchart TB
+flowchart LR
     User["👤 User/Customer"] -- request --> OrchestratorAgent["🤖 Orchestrator Agent"]
     OrchestratorAgent -- response --> User
-    OrchestratorAgent -- delegate --> InventoryAgent["📦 Inventory Manager Agent"] & QuoteAgent["💰 Quote Generator Agent"] & SalesAgent["🛒 Sales Agent"] & ReportingAgent["📊 Reporting Agent"]
-    InventoryAgent -- answer --> OrchestratorAgent
-    QuoteAgent -- answer --> OrchestratorAgent
-    SalesAgent -- answer --> OrchestratorAgent
-    ReportingAgent -- answer --> OrchestratorAgent
 
-    OrchestratorNotes["Responsibilities:<br>• Single contact point for customer requests<br>• Analyze incoming requests<br>• Dispatch tasks to specialized agents<br>• Synthesize agent answers<br>• Create the final customer answer"] -.-> OrchestratorAgent
-    InventoryNotes["Responsibilities:<br>• Track company inventory<br>• Answer inventory-related questions<br>• Check whether goods requests can be fulfilled<br>• Assess reorder needs"] -.-> InventoryAgent
-    QuoteNotes["Responsibilities:<br>• Generate customer quotes, including pricing<br>• Apply bulk discounts"] -.-> QuoteAgent
-    SalesNotes["Responsibilities:<br>• Finalize and register sales transactions<br>• Consider inventory levels and delivery timelines<br>• Report successful transaction execution"] -.-> SalesAgent
-    ReportingNotes@{ shape: comment, label: "Responsibilities:<br/>• Monitor the company's financial situation<br/>• Report financial KPIs" } -.-> ReportingAgent
+    OrchestratorNotes["Responsibilities:<br>• Single contact point for customer requests<br>• Analyze incoming requests<br>• Dispatch tasks to specialized agents<br>• Synthesize agent answers<br>• Create the final customer answer<br>• Limits per run: max 10 subagent calls, max 20 tool calls (soft limit)"] -.-> OrchestratorAgent
+    InventoryNotes["Responsibilities:<br>• Track company inventory<br>• Answer inventory-related questions<br>• Check whether goods requests can be fulfilled<br>• Assess reorder needs<br>• Place explicitly requested stock reorders<br>• max 10 steps, max 20 tool calls per run"] -.-> InventoryAgent["📦 Inventory Manager Agent"]
+    QuoteNotes["Responsibilities:<br>• Generate customer quotes, including pricing<br>• Apply bulk discounts<br>• max 6 steps, max 20 tool calls per run"] -.-> QuoteAgent["💰 Quote Generator Agent"]
+    SalesNotes["Responsibilities:<br>• Finalize and register sales transactions<br>• Consider inventory levels and delivery timelines<br>• Report successful transaction execution<br>• max 12 steps, max 20 tool calls per run"] -.-> SalesAgent["🛒 Sales Agent"]
+    ReportingNotes@{ shape: comment, label: "Responsibilities:<br/>• Monitor the company's financial situation<br/>• Report financial KPIs<br/>• max 6 steps, max 20 tool calls per run" } -.-> ReportingAgent["📊 Reporting Agent"]
 
-    InventoryAgent --> ToolCheckInventory["tool_check_inventory"] & ToolCheckStockLevel["tool_check_stock_level"] & ToolCheckDeliveryTimeline["tool_check_delivery_timeline"]
-    QuoteAgent --> ToolReadQuoteHistory["tool_read_quote_history"]
-    SalesAgent --> ToolExecuteOrder["tool_execute_order"] & ToolCheckStockLevel
-    ReportingAgent --> ToolGetCashBalance["tool_get_cash_balance"] & ToolGenerateReport["tool_generate_financial_report"]
+    OrchestratorAgent -- call --> InventoryAgent
+    OrchestratorAgent -- call --> QuoteAgent
+    OrchestratorAgent -- call --> SalesAgent
+    OrchestratorAgent -- call --> ReportingAgent
 
+    OrchestratorAgent --> ToolResolveProduct["tool_resolve_product_name"] & ToolCalculator["tool_calculator"]
+    InventoryAgent --> ToolCheckInventory["tool_check_inventory"] & ToolCheckStockLevel["tool_check_stock_level"] & ToolCheckDeliveryTimeline["tool_check_delivery_timeline"] & ToolGetUnitPrice["tool_get_unit_price"] & ToolCalculator & ToolExecuteOrder["tool_execute_order"]
+    QuoteAgent --> ToolReadQuoteHistory["tool_read_quote_history"] & ToolGetUnitPrice & ToolCalculator
+    SalesAgent --> ToolExecuteOrder & ToolCheckStockLevel & ToolCalculator
+    ReportingAgent --> ToolGetCashBalance["tool_get_cash_balance"] & ToolGenerateReport["tool_generate_financial_report"] & ToolCalculator
+
+    ToolResolveProduct --> FuncResolveProductName["_resolve_product_name (alias/fuzzy matching)"]
+    ToolCalculator --> FuncEval["_eval_node (safe arithmetic evaluator)"]
+    ToolGetUnitPrice --> Database
     ToolCheckInventory --> FuncGetAllInventory["get_all_inventory"]
     ToolCheckStockLevel --> FuncGetStockLevel["get_stock_level"]
     ToolCheckDeliveryTimeline --> FuncGetSupplierDeliveryDate["get_supplier_delivery_date"]
@@ -56,6 +66,14 @@ flowchart TB
     QuoteAgent:::agentStyle
     SalesAgent:::agentStyle
     ReportingAgent:::agentStyle
+    OrchestratorNotes:::noteStyle
+    InventoryNotes:::noteStyle
+    QuoteNotes:::noteStyle
+    SalesNotes:::noteStyle
+    ReportingNotes:::noteStyle
+    ToolResolveProduct:::toolStyle
+    ToolCalculator:::toolStyle
+    ToolGetUnitPrice:::toolStyle
     ToolCheckInventory:::toolStyle
     ToolCheckStockLevel:::toolStyle
     ToolCheckDeliveryTimeline:::toolStyle
@@ -63,6 +81,8 @@ flowchart TB
     ToolExecuteOrder:::toolStyle
     ToolGetCashBalance:::toolStyle
     ToolGenerateReport:::toolStyle
+    FuncResolveProductName:::funcStyle
+    FuncEval:::funcStyle
     FuncGetAllInventory:::funcStyle
     FuncGetStockLevel:::funcStyle
     FuncGetSupplierDeliveryDate:::funcStyle
@@ -75,9 +95,10 @@ flowchart TB
     LegendTool:::toolStyle
     LegendFunction:::funcStyle
 
-    classDef userStyle stroke:#fb7185,fill:#fff1f2
-    classDef orchestratorStyle stroke:#818cf8,fill:#eef2ff
-    classDef agentStyle stroke:#38bdf8,fill:#f0f9ff
-    classDef toolStyle stroke:#4ade80,fill:#f0fdf4
-    classDef funcStyle stroke:#facc15,fill:#fefce8
-    classDef dbStyle stroke:#f87171,fill:#fef2f2
+    classDef userStyle stroke:#fb7185,fill:#fff1f2,color:#111827
+    classDef orchestratorStyle stroke:#818cf8,fill:#eef2ff,color:#111827
+    classDef agentStyle stroke:#38bdf8,fill:#f0f9ff,color:#111827
+    classDef noteStyle stroke:#c2410c,fill:#fff7ed,color:#111827
+    classDef toolStyle stroke:#4ade80,fill:#f0fdf4,color:#111827
+    classDef funcStyle stroke:#facc15,fill:#fefce8,color:#111827
+    classDef dbStyle stroke:#f87171,fill:#fef2f2,color:#111827
