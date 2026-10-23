@@ -1,0 +1,53 @@
+request_id,request_date,cash_balance,inventory_value,response
+1,2025-04-01,45025.7,4974.3,"Your order for the ceremony has been successfully placed. 
+
+- 200 sheets of Glossy paper: $40.00 (Estimated delivery date: 2025-04-05) 
+- 100 sheets of Cardstock: $15.00 (In stock) 
+- 100 sheets of Colored paper: $10.00 (In stock) 
+
+Total estimate: $65.00 
+
+Thank you!"
+2,2025-04-03,45025.7,4974.3,"I apologize, but I cannot fulfill your order as the product 'balloons' is not in our portfolio."
+3,2025-04-04,45025.7,4974.3,"We apologize, but we cannot fulfill your request due to the unavailability of A3 paper in our product portfolio. Please let us know if you would like to adjust your order or if there are other products you need."
+4,2025-04-05,45112.45,4887.549999999999,"Order successful: 500 sheets of Cardstock and 250 sheets of A4 paper. Total amount: $87.50. Items will be delivered by April 15, 2025."
+5,2025-04-05,45112.45,4887.549999999999,"I'm sorry, but I cannot fulfill your order completely. While we have enough Colored Paper and Cardstock available for delivery by your requested date, the Decorative Washi Tape has a shortfall of 200 rolls, and though it can arrive by April 9, 2025, it cannot be delivered by your deadline of April 15, 2025. Therefore, I cannot proceed with the order."
+6,2025-04-06,45112.45,4887.549999999999,"I apologize, but we cannot fulfill your order for 500 sheets of colorful construction paper, 300 sheets of white printer paper, and 200 sheets of cardstock as none of these items are in stock, and their estimated delivery would not meet your requested delivery date of April 15, 2025."
+7,2025-04-07,45112.45,4887.549999999999,"I apologize, but due to stock shortages for matte A3 paper and heavyweight cardstock, your order cannot be fulfilled in its entirety. The glossy A4 paper and poster boards can be supplied, but you will need to find an alternative for the other two items. Please let me know if you would like to proceed with the available items."
+8,2025-04-07,41425.25,6849.95,"We were able to place the order for the following paper supplies:
+
+- **Glossy paper**: 500 sheets (In stock)
+- **Matte paper**: 1000 sheets (Order placed, estimated delivery: April 11, 2025)
+- **Colored paper**: 2000 sheets (Order placed, estimated delivery: April 14, 2025)
+- **Recycled paper**: 3000 sheets (Order placed, estimated delivery: April 14, 2025)
+
+All items should be delivered by your requested date of **April 15, 2025**."
+9,2025-04-07,41425.25,6849.95,"I apologize, but your order cannot be fulfilled as the A4 paper will arrive after your requested delivery date of April 10, 2025. Please let me know if there's anything else I can assist you with."
+13,2025-04-08,41425.25,6849.95,"We regret to inform you that we cannot fulfill your request for 500 sheets of A4 printing paper and 200 sheets of cardstock by April 10, 2025, as the items are expected to arrive after this date."
+12,2025-04-08,41165.25,7154.95,"Unfortunately, your order of 200 sheets of colorful cardstock, 500 sheets of standard printer paper, and 100 paper napkins cannot be fulfilled as all requested items are out of stock. We are unable to record the order."
+10,2025-04-08,41265.25,7054.95,"Your order has been placed successfully. 
+
+- 500 sheets of Glossy paper: $100.00 
+- 300 sheets of Cardstock: $45.00 
+
+Total: $145.00
+
+The cardstock will arrive by April 12, 2025, and the glossy paper is already in stock."
+11,2025-04-08,41395.65,6978.55,"Your order has been placed successfully for:
+- 500 sheets of Glossy paper at $100.00
+- 300 sheets of Matte paper at $54.00
+
+Total amount: $154.00
+
+Thank you for your order!"
+14,2025-04-09,40513.95,7297.45,"Apologies, but I am unable to fulfill your order for the paper supplies due to issues with inventory availability."
+15,2025-04-12,40513.95,7297.45,"I apologize, but we cannot fulfill your request for the cardboard signage as it is not in our portfolio. Therefore, the whole order has been rejected."
+16,2025-04-13,40513.95,7297.45,"I'm sorry, but the construction paper cannot be delivered by the requested date of April 15, 2025. Therefore, I cannot proceed with the order."
+17,2025-04-14,40513.95,7297.45,"Unfortunately, your order cannot be fulfilled as the delivery deadline of April 15, 2025, cannot be met for the following items:
+- 2000 Paper napkins (estimated delivery on April 21, 2025)
+- 1000 Paper cups (estimated delivery on April 18, 2025)
+
+We apologize for the inconvenience."
+18,2025-04-14,40513.95,7297.45,"I'm sorry, but the standard copy paper cannot be delivered by your requested date of April 15, 2025, as it will arrive on April 18, 2025. Unfortunately, I cannot proceed with your order."
+19,2025-04-15,40513.95,7297.45,"We apologize, but we cannot fulfill your order as the delivery of the required supplies cannot be completed by the requested date of April 20, 2025."
+20,2025-04-17,40513.95,7297.45,"I'm sorry, but I cannot fulfill your order due to the ambiguity with the tickets. Please clarify or provide an exact name for the tickets."
