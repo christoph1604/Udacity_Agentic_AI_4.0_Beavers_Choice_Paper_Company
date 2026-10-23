@@ -18,12 +18,12 @@ flowchart LR
     SalesNotes["Responsibilities:<br>• Finalize and register sales transactions<br>• Consider inventory levels and delivery timelines<br>• Report successful transaction execution<br>• max 12 steps, max 20 tool calls per run"] -.-> SalesAgent["🛒 Sales Agent"]
     ReportingNotes@{ shape: comment, label: "Responsibilities:<br/>• Monitor the company's financial situation<br/>• Report financial KPIs<br/>• max 6 steps, max 20 tool calls per run" } -.-> ReportingAgent["📊 Reporting Agent"]
 
-    OrchestratorAgent -- call --> InventoryAgent
-    OrchestratorAgent -- call --> QuoteAgent
-    OrchestratorAgent -- call --> SalesAgent
-    OrchestratorAgent -- call --> ReportingAgent
+    OrchestratorAgent <--> InventoryAgent
+    OrchestratorAgent <--> QuoteAgent
+    OrchestratorAgent <--> SalesAgent
+    OrchestratorAgent <--> ReportingAgent
 
-    OrchestratorAgent --> ToolResolveProduct["tool_resolve_product_name"] & ToolCalculator["tool_calculator"]
+    OrchestratorAgent --> ToolResolveProduct["tool_resolve_product_name"] & ToolCalculator["tool_calculator"] & ToolParseDate["tool_parse_date"] & ToolCheckDeadline["tool_check_deadline"]
     InventoryAgent --> ToolCheckInventory["tool_check_inventory"] & ToolCheckStockLevel["tool_check_stock_level"] & ToolCheckDeliveryTimeline["tool_check_delivery_timeline"] & ToolGetUnitPrice["tool_get_unit_price"] & ToolCalculator & ToolExecuteOrder["tool_execute_order"]
     QuoteAgent --> ToolReadQuoteHistory["tool_read_quote_history"] & ToolGetUnitPrice & ToolCalculator
     SalesAgent --> ToolExecuteOrder & ToolCheckStockLevel & ToolCalculator
@@ -31,6 +31,8 @@ flowchart LR
 
     ToolResolveProduct --> FuncResolveProductName["_resolve_product_name (alias/fuzzy matching)"]
     ToolCalculator --> FuncEval["_eval_node (safe arithmetic evaluator)"]
+    ToolParseDate --> FuncParseDate["_parse_date_text"]
+    ToolCheckDeadline --> FuncParseDate
     ToolGetUnitPrice --> Database
     ToolCheckInventory --> FuncGetAllInventory["get_all_inventory"]
     ToolCheckStockLevel --> FuncGetStockLevel["get_stock_level"]
@@ -73,6 +75,8 @@ flowchart LR
     ReportingNotes:::noteStyle
     ToolResolveProduct:::toolStyle
     ToolCalculator:::toolStyle
+    ToolParseDate:::toolStyle
+    ToolCheckDeadline:::toolStyle
     ToolGetUnitPrice:::toolStyle
     ToolCheckInventory:::toolStyle
     ToolCheckStockLevel:::toolStyle
@@ -83,6 +87,7 @@ flowchart LR
     ToolGenerateReport:::toolStyle
     FuncResolveProductName:::funcStyle
     FuncEval:::funcStyle
+    FuncParseDate:::funcStyle
     FuncGetAllInventory:::funcStyle
     FuncGetStockLevel:::funcStyle
     FuncGetSupplierDeliveryDate:::funcStyle
