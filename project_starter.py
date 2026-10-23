@@ -1,3 +1,16 @@
+"""Munder Difflin multi-agent paper-supply system.
+
+An OrchestrationAgent receives customer requests and delegates to four specialists:
+InventoryManagerAgent (stock, delivery estimates, reorders), QuoteGeneratorAgent (quotes
+based on historical quotes), SalesAgent (records sales) and ReportingAgent (financial
+reports). Agents exchange validated Pydantic JSON messages through `delegate`, and every
+handoff is appended to HANDOFF_TRACE_FILE.
+
+Data lives in the SQLite database `munder_difflin.db` (see `init_database`). Running the
+module executes `run_test_scenarios`, which replays `quote_requests_sample.csv` in date
+order and writes `test_results.csv`. The model credentials are read from a `.env` file.
+"""
+
 import pandas as pd
 import numpy as np
 import os
@@ -21,7 +34,7 @@ from uuid import uuid4
 
 HANDOFF_TRACE_FILE = "handoff_trace.jsonl"
 MAX_SUBAGENT_CALLS_PER_RUN = 10  # Orchestrator delegations per orchestrator run.
-MAX_TOOL_CALLS_PER_AGENT_RUN = 20  # Tool calls per agent run (orchestrator and each subagent run).
+MAX_TOOL_CALLS_PER_AGENT_RUN = 50  # Tool calls per agent run (orchestrator and each subagent run).
 _HANDOFF_RUN_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "handoff_run_id", default=None
 )
@@ -34,6 +47,7 @@ _HANDOFF_SEQUENCE: contextvars.ContextVar[int] = contextvars.ContextVar(
 
 
 def _get_handoff_logger() -> logging.Logger:
+    """Return the handoff trace logger, attaching the JSONL file handler only once."""
     logger = logging.getLogger("beavers_choice.handoff_trace")
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -59,6 +73,17 @@ def _record_handoff(
     started_at: datetime,
     started_clock: float,
 ) -> None:
+    """Append one handoff record as a JSON line to the trace file.
+
+    Args:
+        source: Name of the caller (e.g. "orchestrator" or "test_runner").
+        destination: Name of the receiving agent.
+        request: Request that was sent.
+        response: Response that came back (or error details).
+        outcome: Result label such as "completed", "rejected", "failed" or "limit_reached".
+        started_at: UTC timestamp when the handoff started.
+        started_clock: `time.perf_counter()` value at the start, used for the elapsed time.
+    """
     sequence = _HANDOFF_SEQUENCE.get() + 1
     _HANDOFF_SEQUENCE.set(sequence)
     completed_at = datetime.now(timezone.utc)
@@ -141,7 +166,14 @@ paper_supplies = [
 
 
 def _normalize_product_text(value: str) -> str:
-    """Lowercase, drop punctuation, singularize each word and join sizes ("Paper Cups!" -> "paper cup")."""
+    """Lowercase, drop punctuation, singularize each word and join sizes ("Paper Cups!" -> "paper cup").
+
+    Args:
+        value: Raw product text.
+
+    Returns:
+        The normalized text, used for catalog and alias comparisons.
+    """
     normalized = unicodedata.normalize("NFKC", value).casefold()
     words = re.sub(r"[^\w]+", " ", normalized).split()
     text = " ".join(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words)
@@ -194,6 +226,7 @@ _LIST_SEPARATOR = re.compile(r"\s+(?:and|&)\s+|[,;/]", re.IGNORECASE)
 
 
 def _product_tokens(normalized_name: str) -> set:
+    """Return the words of a normalized name that are not generic filler (e.g. "paper")."""
     return {t for t in normalized_name.split() if t not in _GENERIC_WORDS}
 
 
@@ -202,10 +235,19 @@ def _resolve_product_name(product_name: str) -> Dict[str, Any]:
 
     Order: exact name or mapping, several products in one text, catalog name inside the text,
     mapping phrase inside the text, typo, part of a catalog name.
+
+    Args:
+        product_name: Product text as written by the customer.
+
+    Returns:
+        A dict with `status` ("matched", "ambiguous" or "unknown"), `requested_name`,
+        `resolved_name` (the catalog name if matched, else None) and `candidates`
+        (possible catalog names if ambiguous).
     """
     normalized_name = _normalize_product_text(product_name)
 
     def result(status: str, resolved: Optional[str] = None, candidates=()):
+        """Build the resolution dict returned by `_resolve_product_name`."""
         return {
             "status": status,
             "requested_name": product_name,
@@ -270,6 +312,18 @@ def _resolve_product_name(product_name: str) -> Dict[str, Any]:
 
 
 def _normalize_request_products(request_model: BaseModel) -> Tuple[BaseModel, Optional[str], str]:
+    """Replace the product names of a request (`item` or `items`) with catalog names.
+
+    Args:
+        request_model: A validated request model with an `item` or `items` field. Models
+            with neither field are returned unchanged.
+
+    Returns:
+        A tuple `(request, error, status)`. On success `request` is a copy with canonical
+        names, `error` is None and `status` is "". If a product is unknown, `request` is
+        unchanged, `error` is an instruction for the calling agent and `status` is
+        "rejected"; if it is ambiguous, `status` is "needs_info".
+    """
     if hasattr(request_model, "item"):
         original_names = [request_model.item]
         field_name = "item"
@@ -914,6 +968,76 @@ def tool_check_delivery_timeline(input_date: str, quantity: int) -> str:
     """
     return get_supplier_delivery_date(input_date, quantity)
 
+_DATE_FORMATS = (
+    "%Y-%m-%d", "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
+    "%d %B %Y", "%d %b %Y", "%d. %B %Y",
+)
+
+def _parse_date_text(date_text: str, reference_date: Optional[str] = None) -> DateType:
+    """Parse an ISO or written date such as 'April 15th, 2025'; a missing year uses the reference year.
+
+    Args:
+        date_text: Date text; ordinal suffixes and prefixes such as "by" or "on" are ignored.
+        reference_date: Optional date whose year is used when `date_text` has no year.
+
+    Returns:
+        The parsed date.
+
+    Raises:
+        ValueError: If the text is not a recognized date.
+    """
+    cleaned = re.sub(r"(?<=\d)(st|nd|rd|th)\b", "", str(date_text).strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(on|by|before|until|no later than)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.split("T")[0].strip().rstrip(".")
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    if reference_date:
+        reference_year = _parse_date_text(reference_date).year
+        for fmt in ("%B %d", "%b %d", "%d %B", "%d %b"):
+            try:
+                return datetime.strptime(f"{cleaned} {reference_year}", f"{fmt} %Y").date()
+            except ValueError:
+                continue
+    raise ValueError(f"Unrecognized date: '{date_text}'")
+
+@tool
+def tool_parse_date(date_text: str, reference_date: str = "") -> str:
+    """
+    Tool for converting a date written in text, e.g. "April 15, 2025" or "April 15th", to ISO format.
+
+    Args:
+        date_text (str): The date as written by the customer, or already in ISO format.
+        reference_date (str, optional): The request date (YYYY-MM-DD); its year is used when date_text has no year.
+
+    Returns:
+        str: The date in ISO format (YYYY-MM-DD).
+    """
+    return _parse_date_text(date_text, reference_date or None).isoformat()
+
+@tool
+def tool_check_deadline(arrivals: dict, deadline: str) -> Dict[str, Any]:
+    """
+    Tool for checking whether estimated arrival dates meet a customer's delivery deadline.
+    An arrival on the deadline date counts as on time.
+
+    Args:
+        arrivals (dict): Mapping of item name to estimated arrival date (YYYY-MM-DD), only for items that need to be delivered.
+        deadline (str): The customer's requested delivery date (YYYY-MM-DD).
+
+    Returns:
+        Dict[str, Any]: {"deadline_met": bool, "late_items": {item: days_late}}; deadline_met is true only if no item arrives after the deadline.
+    """
+    deadline_date = _parse_date_text(deadline)
+    late_items = {}
+    for item, arrival in arrivals.items():
+        days_late = (_parse_date_text(arrival) - deadline_date).days
+        if days_late > 0:
+            late_items[item] = days_late
+    return {"deadline_met": not late_items, "late_items": late_items}
+
 @tool
 def tool_get_unit_price(item_name: str) -> float:
     """
@@ -943,6 +1067,20 @@ _CALC_OPS = {
 }
 
 def _eval_node(node: ast.AST) -> float:
+    """Evaluate a parsed arithmetic expression using only whitelisted operations.
+
+    Allowed are numeric constants, the operators in `_CALC_OPS` and calls to max, min and
+    round, so no arbitrary code can run (unlike `eval`).
+
+    Args:
+        node: AST node of the expression.
+
+    Returns:
+        The numeric result.
+
+    Raises:
+        ValueError: If the expression contains anything else.
+    """
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _CALC_OPS:
@@ -1076,11 +1214,24 @@ STRICT_JSON_FINAL_ANSWER_INSTRUCTION = (
 )
 
 def parse_model(model_cls: Type[ModelT], answer: Any) -> ModelT:
-    """Parse an agent's final answer (dict or JSON string) into model_cls."""
+    """Parse an agent's final answer (dict or JSON string) into model_cls.
+
+    Args:
+        model_cls: Pydantic model to validate against.
+        answer: The answer as a dict or a JSON string.
+
+    Returns:
+        The validated model instance.
+
+    Raises:
+        json.JSONDecodeError: If a string answer is not valid JSON.
+        ValidationError: If the data does not match `model_cls`.
+    """
     data = answer if isinstance(answer, dict) else json.loads(answer)
     return model_cls.model_validate(data)
 
 def _has_side_effecting_tool_call(memory: Any) -> bool:
+    """Return True if the agent already called `tool_execute_order` in this run (a retry would repeat it)."""
     return any(
         getattr(tool_call, "name", None) == "tool_execute_order"
         for step in getattr(memory, "steps", [])
@@ -1088,8 +1239,19 @@ def _has_side_effecting_tool_call(memory: Any) -> bool:
     )
 
 def make_final_answer_check(model_cls: Type[BaseModel]) -> Callable[..., bool]:
-    """Validate structured output and allow at most one safe correction attempt."""
+    """Validate structured output and allow at most one safe correction attempt.
+
+    Args:
+        model_cls: Pydantic model the final answer must conform to.
+
+    Returns:
+        A smolagents final-answer check. It returns True for a valid answer and raises
+        ValueError otherwise, which makes the agent correct its answer once. No retry is
+        allowed after `tool_execute_order` ran or after one retry; the agent is then
+        interrupted and flagged with `_structured_response_retry_exhausted`.
+    """
     def check_final_answer(final_answer: Any, memory: Any, agent: Any = None) -> bool:
+        """Raise ValueError if `final_answer` does not validate as `model_cls`."""
         try:
             parse_model(model_cls, final_answer)
         except (json.JSONDecodeError, ValidationError, TypeError) as e:
@@ -1120,15 +1282,20 @@ def apply_run_limits(agent: ToolCallingAgent) -> None:
 
     Tools are copied first because some tool objects are shared between agents.
     Once the cap is reached, tools return a message instead of executing (soft limit).
+
+    Args:
+        agent: Agent to modify in place; its tools and `run` method are replaced.
     """
     agent._tool_call_count = 0
     agent._subagent_call_count = 0
 
     def budgeted(tool_obj):
+        """Return a copy of the tool that counts calls and stops executing past the limit."""
         tool_copy = copy.copy(tool_obj)
         original_forward = tool_copy.forward
 
         def forward(*args, **kwargs):
+            """Run the tool, or return a limit message once the per-run budget is used up."""
             agent._tool_call_count += 1
             if agent._tool_call_count > MAX_TOOL_CALLS_PER_AGENT_RUN:
                 return (
@@ -1147,6 +1314,7 @@ def apply_run_limits(agent: ToolCallingAgent) -> None:
     original_run = agent.run
 
     def run(*args, **kwargs):
+        """Reset the per-run counters, then run the agent."""
         agent._tool_call_count = 0
         agent._subagent_call_count = 0
         return original_run(*args, **kwargs)
@@ -1160,7 +1328,23 @@ def delegate(
     response_cls: Type[BaseModel],
     caller: Optional[ToolCallingAgent] = None,
 ) -> str:
-    """Validate the request, run the agent, and return its validated response as JSON."""
+    """Validate the request, run the agent, and return its validated response as JSON.
+
+    Problems are reported as a `response_cls` JSON with a non-ok status instead of
+    exceptions, and every outcome is written to the handoff trace. Statuses: "rejected"
+    (subagent call limit reached, invalid request or unknown product), "needs_info"
+    (ambiguous product) and "failed" (agent error or invalid final answer).
+
+    Args:
+        agent: Specialist agent to run.
+        request: Request from the caller, as a dict or JSON string.
+        request_cls: Pydantic model the request must conform to.
+        response_cls: Pydantic model of the agent's response.
+        caller: Calling agent whose subagent-call counter is incremented, if given.
+
+    Returns:
+        The response as a JSON string.
+    """
     started_at = datetime.now(timezone.utc)
     started_clock = time.perf_counter()
     agent_name = getattr(agent, "name", type(agent).__name__)
@@ -1272,8 +1456,16 @@ class InventoryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task: str = Field(min_length=1, description="What the inventory manager should do.")
+    action: Literal["check", "reorder"] = Field(
+        description=(
+            "'check' is read-only: report stock, shortfall and estimated supplier arrival, never order. "
+            "'reorder' places stock orders for exactly the listed quantities; use it only after the "
+            "customer's deadline (if any) was verified to be achievable."
+        )
+    )
     items: List[InventoryItemRequest] = Field(
-        min_length=1, description="Requested items with quantities."
+        min_length=1,
+        description="Requested items with quantities; for action 'reorder' the quantities to order (the shortfalls).",
     )
     date: DateType = Field(
         description="Request date in YYYY-MM-DD format; use it as the stock-check cutoff and transaction posting date."
@@ -1379,6 +1571,7 @@ class QuoteResponse(BaseModel):
 
     @model_validator(mode="after")
     def check_line_items(self):
+        """Require line items for an ok quote."""
         if self.status == "ok" and not self.line_items:
             raise ValueError("line_items are required when status is ok")
         return self
@@ -1413,6 +1606,7 @@ class SalesRequest(BaseModel):
 
     @model_validator(mode="after")
     def check_quote_total(self):
+        """Require quote_total, if given, to match the sum of the item prices (1 cent tolerance)."""
         if self.quote_total is not None:
             if abs(sum(i.total_price for i in self.items) - self.quote_total) > 0.01:
                 raise ValueError("quote_total must equal the sum of the item total_price values")
@@ -1434,6 +1628,7 @@ class SaleResult(BaseModel):
 
     @model_validator(mode="after")
     def check_recorded(self):
+        """Require a transaction ID and price for every recorded item."""
         if self.recorded and (self.transaction_id is None or self.total_price is None):
             raise ValueError("recorded items need transaction_id and total_price")
         return self
@@ -1452,6 +1647,7 @@ class SalesResponse(BaseModel):
 
     @model_validator(mode="after")
     def check_consistency(self):
+        """Enforce all-or-nothing sales and a total_recorded that matches the recorded items."""
         recorded = [i for i in self.items if i.recorded]
         if self.status == "ok" and (not self.items or len(recorded) != len(self.items)):
             raise ValueError("status ok requires all items to be recorded")
@@ -1491,6 +1687,7 @@ class ReportResponse(BaseModel):
 
     @model_validator(mode="after")
     def check_report(self):
+        """Require as_of_date for an ok report and total_assets = cash_balance + inventory_value."""
         if self.status == "ok" and self.as_of_date is None:
             raise ValueError("as_of_date is required when status is ok")
         figures = (self.cash_balance, self.inventory_value, self.total_assets)
@@ -1509,10 +1706,11 @@ class OrchestrationAgent(ToolCallingAgent):
     reporting agent prepares dated financial reports.
 
     For customer requests that require specific items or quantities, the orchestrator
-    lets check inventory before quoting or completing a sale. If on-hand stock is
-    insufficient, it explicitly asks the inventory manager to place a stock order for
-    the shortage, then communicates any missing order details or estimated delivery
-    timing without presenting incoming stock as already available.
+    first asks the inventory manager for a read-only stock check. If stock is
+    insufficient and the customer named a delivery deadline, the orchestrator itself
+    verifies the estimated arrivals against it (with date tools) and only then
+    explicitly asks the inventory manager to reorder the shortage. It never presents
+    incoming stock as already available unless the reorder was confirmed.
 
     Attributes:
         model (OpenAIServerModel): The language model used for reasoning and decision-making.
@@ -1542,16 +1740,18 @@ class OrchestrationAgent(ToolCallingAgent):
         "delivery estimates, and stock reorders. Every inventory manager request must "
         "be a JSON object that conforms to this JSON schema (no extra fields):\n"
         f"{INVENTORY_REQUEST_SCHEMA}\n"
-        'Example: {"task": "Check on-hand stock", "item": "A4 paper", '
-        '"quantity": 500, "date": "2025-04-01"}\n'
+        'Example: {"task": "Check on-hand stock", "action": "check", "items": '
+        '[{"item": "A4 paper", "quantity": 500}], "date": "2025-04-01"}\n'
         "The inventory manager replies with a JSON object that conforms to this JSON "
         "schema:\n"
         f"{INVENTORY_RESPONSE_SCHEMA}\n"
         "Check status first; match each response entry in items by item name and use "
         "its stock_on_hand, shortfall, estimated_delivery_date, order_placed, and "
-        "total_price instead of inferring them from result.\n"
+        "total_price instead of inferring them from result. The inventory manager "
+        "never compares dates and orders stock only with action \"reorder\".\n"
         "- Call the quote generator when a customer asks for a quote or pricing "
-        "guidance. Call the inventory manager once with all requested items first, then "
+        "guidance. Follow the procedure below: check stock with the inventory manager "
+        "first (and reorder only as described there), then "
         "send the quote generator a JSON object that conforms to this JSON schema, "
         "filling stock_on_hand and estimated_delivery_date per item from the "
         "inventory manager's responses:\n"
@@ -1582,27 +1782,35 @@ class OrchestrationAgent(ToolCallingAgent):
         f"{REPORT_RESPONSE_SCHEMA}\n"
         "Check status first; take cash_balance, inventory_value, and total_assets from "
         "the structured fields and any other details from result.\n\n"
-        "When forwarding a task to a specialist, always formulate a clear request that includes all relevant details and context. "
-        "For a customer quote or purchase request that names one or more items and "
-        "quantities, call the inventory manager exactly once with all items in its "
-        "items array before quoting availability or asking the sales agent to record "
-        "a sale. Include in the task any delivery deadline and whether shortfall "
-        "reorders are authorized. The inventory manager checks stock, estimates any "
-        "shortfall delivery, and places authorized orders in that same run, but only "
-        "when the estimate meets the customer's requested delivery date. If any "
-        "out-of-stock item would arrive after that date, do not quote or record any "
-        "part of the purchase; reject the request with a brief apology and explain "
-        "that it cannot arrive by the requested date. Never call the inventory "
-        "manager again for individual items or follow-up orders. Use the request date "
-        "as the posting date for stock orders and sales.\n\n"
+        "When forwarding a task to a specialist, always formulate a clear request that includes all relevant details and context.\n"
+        "Procedure for a customer quote or purchase request that names items and "
+        "quantities (follow the steps in order):\n"
+        "1. Convert the customer's delivery deadline, if any, to YYYY-MM-DD with "
+        "tool_parse_date, passing the request date as reference_date.\n"
+        "2. Call the inventory manager once with action \"check\" and all items. A check "
+        "never orders anything.\n"
+        "3. If no item has a shortfall, no reorder is needed: skip to step 6.\n"
+        "4. If a deadline exists, call tool_check_deadline with the "
+        "estimated_delivery_date of every item that has a shortfall (item name -> date) "
+        "and the deadline. Never compare dates yourself. An arrival on the deadline "
+        "date is on time. If deadline_met is false, do not reorder, quote or sell any "
+        "part of the request; reject it with a brief apology explaining that it cannot "
+        "arrive by the requested date. Stop here.\n"
+        "5. If there is no deadline, or deadline_met is true, call the inventory manager "
+        "once more with action \"reorder\", listing only the items with a shortfall and "
+        "their shortfall quantities. This is the only way to order stock. Never reorder "
+        "when the deadline cannot be met, and never reorder items that are in stock. If "
+        "any order fails, reject the whole request.\n"
+        "6. Continue with the quote generator and sales agent. Use the request date as "
+        "the posting date for stock orders and sales.\n"
+        "Never call the inventory manager for individual items or further follow-ups.\n\n"
         "Do not pass a price; the inventory "
         "manager determines the purchase price itself. Do not say the order was placed "
         "unless the inventory manager confirms successful execution.\n\n"
-        "For this example, after the inventory manager confirms a reorder that meets "
-        "the customer's requested delivery date, treat the ordered quantity as "
+        "For this example, after the inventory manager confirms a reorder that you "
+        "authorized in step 5, treat the ordered quantity as "
         "available for a sale posted on the request date, even if the estimated "
-        "arrival is later than the request date. Never use this assumption when the "
-        "estimated arrival misses the customer's requested delivery date. Include "
+        "arrival is later than the request date. Include "
         "the stock and delivery findings (including dates) in any follow-up call to "
         "the quote generator.\n\n"
         "Always use tool_calculator for any arithmetic; never calculate in your head.\n\n"
@@ -1617,6 +1825,11 @@ class OrchestrationAgent(ToolCallingAgent):
     )
 
     def __init__(self, model: OpenAIServerModel):
+        """Create the specialist agents and the delegation tools of the orchestrator.
+
+        Args:
+            model: Language model shared by the orchestrator and all specialists.
+        """
         self.model = model
         self.inventory_manager_agent = InventoryManagerAgent(model)
         self.quote_generator_agent = QuoteGeneratorAgent(model)
@@ -1628,7 +1841,7 @@ class OrchestrationAgent(ToolCallingAgent):
             """Delegate inventory and supplier delivery questions to the inventory manager.
 
             Args:
-                request: Object with task (str), items (list of objects with item (str) and quantity (int)), and date (YYYY-MM-DD).
+                request: Object with task (str), action ("check" or "reorder"), items (list of objects with item (str) and quantity (int)), and date (YYYY-MM-DD).
 
             Returns:
                 The inventory manager's response as a JSON string conforming to InventoryResponse, with one result per item.
@@ -1676,6 +1889,8 @@ class OrchestrationAgent(ToolCallingAgent):
             tools=[
                 tool_resolve_product_name,
                 tool_calculator,
+                tool_parse_date,
+                tool_check_deadline,
                 call_inventory_manager,
                 call_quote_generator,
                 call_sales_agent,
@@ -1687,8 +1902,8 @@ class OrchestrationAgent(ToolCallingAgent):
 
 class InventoryManagerAgent(ToolCallingAgent):
     """
-    Checks item stock levels, estimates supplier delivery dates, and places explicitly
-    requested stock reorders when the required order details are available.
+    Checks item stock levels and estimates supplier delivery dates (action "check", read-only),
+    and places stock orders only when the orchestrator explicitly requests them (action "reorder").
 
     Attributes:
         model (OpenAIServerModel): The language model used for reasoning and decision-making.
@@ -1703,26 +1918,28 @@ class InventoryManagerAgent(ToolCallingAgent):
         "Use date as the request date and stock-check cutoff. If placing a stock order, "
         "also use this date as its transaction date.\n\n"
         "## Process\n"
-        "1. Process every entry in items during this run, using its exact item name and "
-        "quantity. Check stock as of the requested date and return exactly one result "
-        "for each requested item. Do not repeat completed tool calls.\n"
+        "Look at action first. Never compare dates with a customer deadline; that is "
+        "the orchestrator's job.\n"
+        '### action "check" (read-only)\n'
+        "1. Process every entry in items, using its exact item name and quantity. Check "
+        "stock as of the requested date and return exactly one result for each requested "
+        "item. Do not repeat completed tool calls.\n"
         "2. For each item whose stock is below its requested quantity, calculate the "
-        "shortfall once with tool_calculator and estimate delivery for that shortfall from the request date. "
-        "For items with sufficient stock, do not calculate a shortfall or delivery date.\n"
-        "3. Place stock reorders only when the task explicitly authorizes them, and order "
-        "only each item's shortfall. If the task includes the customer's requested "
-        "delivery date and any item's estimated arrival is later, place no order for "
-        "any item. Leave order_placed false for all items and report the shortfalls and "
-        "estimated arrivals so the orchestrator can reject the whole request. Before ordering, "
-        "look up each item's unit price with the unit price "
-        "tool and use unit price times shortfall as the total purchase price; never ask "
-        "the requester for a price. Ask for any other missing details instead of "
-        "guessing.\n"
-        "4. Record the order with tool_execute_order using "
-        'transaction_type="stock_orders" and the request date as the transaction date. '
-        "Keep the estimated delivery date only as an arrival estimate; for this example, "
-        "the reorder is treated as available on its request-date posting.\n"
-        "5. Report that the reorder was placed only after the tool confirms it.\n"
+        "shortfall once with tool_calculator and estimate delivery for that shortfall "
+        "from the request date. For items with sufficient stock, do not calculate a "
+        "shortfall or delivery date.\n"
+        "3. NEVER call tool_execute_order and never place an order in this mode. Leave "
+        "order_placed false for all items.\n"
+        '### action "reorder"\n'
+        "1. The orchestrator has already verified the stock and any deadline. Do not "
+        "re-check stock or delivery dates. For every entry in items, order exactly its "
+        "quantity.\n"
+        "2. Look up each item's unit price with the unit price tool and use unit price "
+        "times quantity (tool_calculator) as the total purchase price; never ask the "
+        "requester for a price. Ask for any other missing details instead of guessing.\n"
+        "3. Record each order with tool_execute_order using "
+        'transaction_type="stock_orders" and the request date as the transaction date.\n'
+        "4. Report that an order was placed only after the tool confirms it.\n"
         "Do not use this process to record customer sales.\n\n"
         "## Output\n"
         "Finish by calling final_answer with one JSON string that conforms to this JSON "
@@ -1733,8 +1950,8 @@ class InventoryManagerAgent(ToolCallingAgent):
         "Put any human-readable summary in the result field; never pass plain text to "
         "final_answer.\n"
         "- Set order_placed to true only after tool_execute_order succeeds, and then also "
-        "set transaction_id and total_price. Keep estimated_delivery_date as the "
-        "supplier's estimated arrival date, which may differ from the transaction date.\n"
+        "set transaction_id and total_price. In check mode, estimated_delivery_date is "
+        "the supplier's estimated arrival date of the shortfall; it is not a transaction date.\n"
         "- Use status needs_info if required details are missing.\n\n"
         "Example final_answer argument for a stock check without a shortfall:\n"
         '{"status": "ok", "result": "Stock check complete.", "items": '
@@ -1744,6 +1961,11 @@ class InventoryManagerAgent(ToolCallingAgent):
     )
 
     def __init__(self, model: OpenAIServerModel):
+        """Set up the inventory manager with its tools, prompt, answer check and run limits.
+
+        Args:
+            model: Language model used by the agent.
+        """
         super().__init__(
             model=model,
             tools=[
@@ -1807,6 +2029,11 @@ class QuoteGeneratorAgent(ToolCallingAgent):
     )
 
     def __init__(self, model: OpenAIServerModel):
+        """Set up the quote generator with its tools, prompt, answer check and run limits.
+
+        Args:
+            model: Language model used by the agent.
+        """
         super().__init__(
             model=model,
             tools=[tool_read_quote_history, tool_get_unit_price, tool_calculator],
@@ -1866,6 +2093,11 @@ class SalesAgent(ToolCallingAgent):
     )
 
     def __init__(self, model: OpenAIServerModel):
+        """Set up the sales agent with its tools, prompt, answer check and run limits.
+
+        Args:
+            model: Language model used by the agent.
+        """
         super().__init__(
             model=model,
             tools=[tool_execute_order, tool_check_stock_level, tool_calculator],
@@ -1919,6 +2151,11 @@ class ReportingAgent(ToolCallingAgent):
     )
 
     def __init__(self, model: OpenAIServerModel):
+        """Set up the reporting agent with its tools, prompt, answer check and run limits.
+
+        Args:
+            model: Language model used by the agent.
+        """
         super().__init__(
             model=model,
             tools=[tool_generate_financial_report, tool_get_cash_balance, tool_calculator],
@@ -1934,6 +2171,15 @@ class ReportingAgent(ToolCallingAgent):
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
 def run_test_scenarios():
+    """Replay the sample quote requests through the multi-agent system.
+
+    Re-initializes the database, processes `quote_requests_sample.csv` in date order via
+    the orchestrator, traces each run, and writes cumulative results to `test_results.csv`.
+
+    Returns:
+        A list with one dict per request (request_id, request_date, cash_balance,
+        inventory_value, response), or None if the sample file cannot be loaded.
+    """
     
     print("Initializing Database...")
     init_database(db_engine)
