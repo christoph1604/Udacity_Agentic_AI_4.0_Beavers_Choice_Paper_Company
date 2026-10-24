@@ -1041,7 +1041,8 @@ def tool_check_deadline(arrivals: dict, deadline: str) -> Dict[str, Any]:
 @tool
 def tool_get_unit_price(item_name: str) -> float:
     """
-    Tool for looking up the unit price of an item in the inventory table.
+    Tool for looking up the unit price of an item. Uses the inventory table and falls back
+    to the product catalog, because only part of the catalog is stocked in the inventory.
 
     Args:
         item_name (str): The exact name of the item.
@@ -1054,9 +1055,12 @@ def tool_get_unit_price(item_name: str) -> float:
         db_engine,
         params={"item_name": item_name},
     )
-    if result.empty:
-        raise ValueError(f"Unknown item: {item_name}")
-    return float(result["unit_price"].iloc[0])
+    if not result.empty:
+        return float(result["unit_price"].iloc[0])
+    for item in paper_supplies:
+        if item["item_name"] == item_name:
+            return float(item["unit_price"])
+    raise ValueError(f"Unknown item: {item_name}")
 
 _CALC_OPS = {
     ast.Add: lambda a, b: a + b,
@@ -1227,7 +1231,13 @@ def parse_model(model_cls: Type[ModelT], answer: Any) -> ModelT:
         json.JSONDecodeError: If a string answer is not valid JSON.
         ValidationError: If the data does not match `model_cls`.
     """
-    data = answer if isinstance(answer, dict) else json.loads(answer)
+    if isinstance(answer, dict):
+        data = answer
+    else:
+        data, end = json.JSONDecoder().raw_decode(answer.strip())
+        # Tolerate only stray closing braces/backticks after the object; reject any other trailing text.
+        if answer.strip()[end:].strip("}` \t\r\n"):
+            raise json.JSONDecodeError("Extra data", answer.strip(), end)
     return model_cls.model_validate(data)
 
 def _has_side_effecting_tool_call(memory: Any) -> bool:
@@ -1794,8 +1804,10 @@ class OrchestrationAgent(ToolCallingAgent):
         "estimated_delivery_date of every item that has a shortfall (item name -> date) "
         "and the deadline. Never compare dates yourself. An arrival on the deadline "
         "date is on time. If deadline_met is false, do not reorder, quote or sell any "
-        "part of the request; reject it with a brief apology explaining that it cannot "
-        "arrive by the requested date. Stop here.\n"
+        "part of the request; reject it with a brief apology that names every item in "
+        "late_items (using the customer's wording of the product), its estimated "
+        "arrival date from the inventory manager, and the requested date. Never give "
+        "a generic reason without naming the items. Stop here.\n"
         "5. If there is no deadline, or deadline_met is true, call the inventory manager "
         "once more with action \"reorder\", listing only the items with a shortfall and "
         "their shortfall quantities. This is the only way to order stock. Never reorder "
@@ -1819,6 +1831,9 @@ class OrchestrationAgent(ToolCallingAgent):
         "Report actions as "
         "completed only after the responsible agent confirms them; otherwise explain "
         "what is pending or what information is needed.\n\n"
+        "Whenever you reject or cannot fulfill a request, name the specific item(s) that "
+        "caused it and the concrete reason (e.g. unknown product, late arrival date, "
+        "failed order).\n"
         "Your reply to the customer is short and only contains what matters to them: "
         "the outcome, items, quantities, prices and delivery dates. Never mention "
         "transaction IDs, tools, agents, or other internal details."
@@ -2189,9 +2204,9 @@ def run_test_scenarios():
             quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
         )
         quote_requests_sample.dropna(subset=["request_date"], inplace=True)
-        quote_requests_sample = quote_requests_sample.sort_values("request_date")
+        #quote_requests_sample = quote_requests_sample.sort_values("request_date")
         #quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[:10]
-        #quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[2]]
+        quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[18]]
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
