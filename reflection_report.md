@@ -75,8 +75,10 @@ together in the following order:
    customer request.
 7. When stock is sufficient or replenishment is confirmed, **Quote** receives
    the normalized items and inventory findings. It searches historical quotes
-   with `tool_read_quote_history`, uses catalogue prices when necessary, and
-   returns item-level estimates. The Orchestrator calculates the total.
+   with `tool_read_quote_history` and returns item-level estimates. When an
+   item is not present in the stocked inventory table, its unit price can fall
+   back to the `paper_supplies` product catalogue. The Orchestrator calculates
+   the total.
 8. For a purchase, the **Sales Agent** receives the quoted prices and final
    total. It performs a final all-item stock check and records every sale with
    `tool_execute_order` only if all items are available. In this project,
@@ -174,23 +176,22 @@ The generated [test_results.csv](./test_results.csv) contains 20 dated
 scenarios from 1 to 17 April 2025. Each row records the request, the
 post-scenario cash balance and inventory value, and the customer response.
 The tests cover successful orders, stock shortfalls, delivery deadlines,
-unsupported products, and an ambiguous product.
+and unsupported products.
 
 | Outcome | Requests | Evidence |
 | --- | ---: | --- |
-| Completed or successfully placed | 5 | Requests 1, 4, 8, 10, and 11 |
-| Rejected | 14 | Unsupported items, insufficient stock, or impossible deadlines |
-| Clarification required | 1 | Request 20: “tickets” was not uniquely resolvable |
+| Completed or successfully placed | 9 | Requests 1, 5-12 |
+| Rejected | 11 | Unsupported items, insufficient stock, or impossible deadlines |
 
 Successful requests demonstrate full processing. Request 1 provided an
-itemized estimate for Glossy paper, Cardstock, and Colored paper, including an
-estimated delivery date for replenished Glossy paper. Request 4 confirmed 500
-sheets of Cardstock and 250 sheets of A4 paper with a total and delivery
-commitment. Requests 8, 10, and 11 show that in-stock items and confirmed
-replenishment can be handled together.
+itemized order for Glossy paper, Cardstock, and Colored paper, including an
+estimated delivery date for replenished Glossy paper. Request 5 confirmed 500
+sheets of Colored paper, 300 sheets of Cardstock, and 200 rolls of decorative
+adhesive tape with a total and delivery commitment. Requests 6-12 further show
+that in-stock items and confirmed replenishment can be handled together.
 
 The rejections are also valuable evidence. The system declined unsupported
-products such as balloons, A3 paper, and cardboard signage, and it rejected
+products such as balloons, A3 paper, cardboard signage, and tickets, and it rejected
 complete requests when required supplies could not arrive in time. It therefore
 does not portray an incomplete order as fulfillable merely because some items
 are available.
@@ -215,8 +216,8 @@ trust.
 - **Helpful communication:** Both successful and rejected responses are polite
   and explain the business reason for the outcome.
 - **Traceable business updates:** Cash and inventory values are recorded after
-  every scenario. After successful request 4, cash rose from $45,025.70 to
-  $45,112.45 and inventory value changed from $4,974.30 to $4,887.55.
+  every scenario. After successful request 5, cash rose from $55,460.70 to
+  $55,588.70 and inventory value changed from $4,974.30 to $4,837.55.
 
 ## 4. Improvement Suggestions
 

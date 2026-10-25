@@ -2204,9 +2204,9 @@ def run_test_scenarios():
             quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
         )
         quote_requests_sample.dropna(subset=["request_date"], inplace=True)
-        #quote_requests_sample = quote_requests_sample.sort_values("request_date")
+        quote_requests_sample = quote_requests_sample.sort_values("request_date")
         #quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[:10]
-        quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[18]]
+        #quote_requests_sample = quote_requests_sample.sort_values("request_date").iloc[[7]]
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
